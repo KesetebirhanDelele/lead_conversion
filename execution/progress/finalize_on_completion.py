@@ -11,6 +11,7 @@ No business logic or scoring lives here.  This file only:
   4. Delegates persistence to persist_final_score.
 """
 
+from execution.course.course_registry import TOTAL_SECTIONS
 from execution.db.sqlite import connect, init_db
 from execution.ghl.build_ghl_full_field_payload import build_ghl_full_field_payload
 from execution.leads.finalize_lead_score import finalize_lead_score
@@ -44,7 +45,7 @@ def _read_completion_pct(lead_id: str, db_path: str | None) -> float:
 def finalize_on_completion(
     lead_id: str,
     *,
-    total_sections: int,
+    total_sections: int = TOTAL_SECTIONS,
     now: str,
     db_path: str | None = None,
     webhook_url: str | None = None,

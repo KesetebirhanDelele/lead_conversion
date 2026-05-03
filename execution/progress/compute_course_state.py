@@ -7,6 +7,7 @@ progress events. No business logic or hot-lead scoring lives here.
 
 from datetime import datetime, timezone
 
+from execution.course.course_registry import TOTAL_SECTIONS
 from execution.db.sqlite import connect, init_db
 from execution.events.send_course_event import send_course_event
 
@@ -18,7 +19,7 @@ def _utc_now() -> str:
 
 def compute_course_state(
     lead_id: str,
-    total_sections: int = 10,
+    total_sections: int = TOTAL_SECTIONS,
     course_id: str = "FREE_INTRO_AI_V0",
     db_path: str | None = None,
     webhook_url: str | None = None,
