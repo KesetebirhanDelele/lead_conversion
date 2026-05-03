@@ -1,0 +1,58 @@
+[
+  {
+    "quiz_id": "quiz_phase2_mod2_1",
+    "title": "Understanding Data — Check",
+    "questions": [
+      {
+        "question": "What is structured data?",
+        "options": [
+          "Data stored in rows and columns with a defined schema",
+          "Any data saved in a text file",
+          "Images and audio recordings",
+          "Data that has never been cleaned"
+        ],
+        "correct_index": 0,
+        "hint": "Think back to the lesson on data types — structured data has a predictable format you might recognize from spreadsheets or databases."
+      },
+      {
+        "question": "Which of the following is an example of unstructured data?",
+        "options": [
+          "A spreadsheet of customer orders",
+          "A database table of employee salaries",
+          "A collection of social media posts",
+          "A CSV file of product prices"
+        ],
+        "correct_index": 2,
+        "hint": "Unstructured data doesn't fit neatly into rows and columns — think about content that is hard to organize in a table."
+      }
+    ]
+  },
+  {
+    "quiz_id": "quiz_phase2_mod2_2",
+    "title": "How Machines Learn — Check",
+    "questions": [
+      {
+        "question": "In supervised learning, the training data includes:",
+        "options": [
+          "Only input features, no labels",
+          "Input features paired with correct output labels",
+          "Random noise to improve generalization",
+          "Unlabeled clusters of examples"
+        ],
+        "correct_index": 1,
+        "hint": "Think back to Reading 4 — the labels on the emails and images are what makes the data supervised."
+      },
+      {
+        "question": "What is the goal of a machine learning model during training?",
+        "options": [
+          "To memorize every training example exactly",
+          "To minimize prediction error on the training data",
+          "To maximize the number of parameters",
+          "To store all data in RAM"
+        ],
+        "correct_index": 1,
+        "hint": "Recall the training loop — each cycle adjusts the model slightly to bring its guesses closer to the correct answers."
+      }
+    ]
+  }
+]

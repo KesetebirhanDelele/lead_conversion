@@ -1,0 +1,93 @@
+"""
+services/worker/run_cory_sync.py
+
+One-shot runner for process_one_cory_sync_record().
+
+Finds the oldest pending CORY_* sync_records row, dispatches it, prints the
+result as JSON, and exits.  Processes at most one row per invocation.
+No loop.  No scheduler.
+
+Run:
+    python services/worker/run_cory_sync.py
+
+Environment variables:
+    DB_PATH             Path to the SQLite database file.
+                        Default: tmp/app.db (via execution/db/sqlite.py)
+    NOW                 ISO-8601 UTC timestamp to inject as the processing time.
+                        Default: datetime.now(timezone.utc) (resolved inside the worker)
+    CORY_DISPATCH_MODE  Dispatch mode: "dry_run" (default), "ghl", "log_sink", or "webhook".
+    CORY_LOG_DIR        Directory for log_sink output files.
+                        Default: tmp/cory_dispatch_log/ (resolved inside the dispatcher)
+    CORY_WEBHOOK_URL    Webhook URL for webhook dispatch mode.
+                        When absent or blank, webhook mode is a safe no-op.
+    CORY_GHL_API_URL    GHL API URL for ghl dispatch mode.
+                        When absent or blank, ghl mode is a safe no-op.
+
+Output (stdout, always valid JSON):
+    {"ok": true,  "processed": false, "reason": "NO_PENDING"}
+    {"ok": true,  "processed": false, "reason": "NO_URL"}
+    {"ok": true,  "processed": true,  "sync_record_id": <id>, "destination": "CORY_*"}
+    {"ok": false, "sync_record_id": <id>, "destination": "CORY_*", "error": "..."}
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from execution.events.process_one_cory_sync_record import (  # noqa: E402
+    process_one_cory_sync_record,
+)
+
+
+def run(
+    db_path:       str | None = None,
+    now:           str | None = None,
+    dispatch_mode: str        = "dry_run",
+    log_dir:       str | None = None,
+    webhook_url:   str | None = None,
+    ghl_api_url:   str | None = None,
+) -> dict:
+    """Call the worker once, print the result as JSON, and return it.
+
+    Args:
+        db_path:       Path to the SQLite file; defaults to tmp/app.db.
+        now:           ISO-8601 UTC string for the processing timestamp.
+                       Passed through to process_one_cory_sync_record unchanged.
+        dispatch_mode: "dry_run" (default), "ghl", "log_sink", or "webhook".
+                       Passed through to process_one_cory_sync_record unchanged.
+        log_dir:       Directory for log_sink output files.
+                       Ignored outside log_sink mode.
+        webhook_url:   URL for webhook dispatch.  When None or blank, webhook
+                       mode is a safe no-op.  Ignored outside webhook mode.
+        ghl_api_url:   URL for GHL API dispatch.  When None or blank, ghl
+                       mode is a safe no-op.  Ignored outside ghl mode.
+
+    Returns:
+        The dict returned by process_one_cory_sync_record().
+    """
+    result = process_one_cory_sync_record(
+        db_path=db_path,
+        now=now,
+        dispatch_mode=dispatch_mode,
+        log_dir=log_dir,
+        webhook_url=webhook_url,
+        ghl_api_url=ghl_api_url,
+    )
+    print(json.dumps(result))
+    return result
+
+
+if __name__ == "__main__":
+    run(
+        db_path=os.environ.get("DB_PATH") or None,
+        now=os.environ.get("NOW") or None,
+        dispatch_mode=os.environ.get("CORY_DISPATCH_MODE") or "dry_run",
+        log_dir=os.environ.get("CORY_LOG_DIR") or None,
+        webhook_url=os.environ.get("CORY_WEBHOOK_URL") or None,
+        ghl_api_url=os.environ.get("CORY_GHL_API_URL") or None,
+    )

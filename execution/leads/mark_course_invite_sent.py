@@ -1,0 +1,89 @@
+"""
+execution/leads/mark_course_invite_sent.py
+
+Records that a "Free Intro to AI Class" invite was sent to a lead.
+Idempotent on invite_id. No business logic lives here.
+"""
+
+import secrets
+from datetime import datetime, timezone
+
+from execution.db.sqlite import connect, init_db
+from execution.leads.upsert_enrollment import upsert_enrollment
+
+
+def _utc_now() -> str:
+    """Return the current UTC time as an ISO 8601 string."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def mark_course_invite_sent(
+    invite_id: str,
+    lead_id: str,
+    sent_at: str | None = None,
+    channel: str | None = None,
+    metadata_json: str | None = None,
+    course_id: str = "FREE_INTRO_AI_V0",
+    db_path: str | None = None,
+) -> None:
+    """Insert a course invite record, skipping silently if it already exists.
+
+    The foreign key constraint on lead_id requires the lead to exist in the
+    leads table before this is called; IntegrityError is not caught here so
+    the caller is made aware of missing leads.
+
+    Args:
+        invite_id:     Stable unique identifier for this invite (TEXT PRIMARY KEY).
+        lead_id:       ID of the lead who was invited.
+        sent_at:       ISO 8601 timestamp of when the invite was sent;
+                       defaults to current UTC if None.
+        channel:       Delivery channel (e.g. "sms", "email", "call").
+        metadata_json: Optional JSON string for extra context.
+        course_id:     Course this invite belongs to. Defaults to
+                       'FREE_INTRO_AI_V0' for backward compatibility.
+        db_path:       Path to the SQLite file; defaults to tmp/app.db.
+    """
+    # Ensure an enrollment row exists before inserting the invite.  Called
+    # before opening the invite connection to avoid concurrent write-lock
+    # contention.  upsert_enrollment is idempotent — safe to call every time.
+    upsert_enrollment(lead_id, course_id=course_id, db_path=db_path)
+
+    conn = connect(db_path)
+    try:
+        init_db(conn)
+
+        existing = conn.execute(
+            "SELECT id, sent_at FROM course_invites WHERE id = ?", (invite_id,)
+        ).fetchone()
+
+        if existing is not None:
+            if existing["sent_at"] is not None:
+                return  # already sent — idempotent no-op
+
+            # Row exists with sent_at = NULL (generated but not yet sent).
+            # Update to record delivery without creating a duplicate row.
+            if sent_at is None:
+                sent_at = _utc_now()
+            conn.execute(
+                "UPDATE course_invites SET sent_at = ?, channel = ? WHERE id = ?",
+                (sent_at, channel, invite_id),
+            )
+            conn.commit()
+            return
+
+        # No row exists yet — insert a complete sent invite row (direct-call path).
+        if sent_at is None:
+            sent_at = _utc_now()
+
+        token = secrets.token_urlsafe(32)
+
+        conn.execute(
+            """
+            INSERT INTO course_invites (id, lead_id, course_id, sent_at, channel, token, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (invite_id, lead_id, course_id, sent_at, channel, token, metadata_json),
+        )
+        conn.commit()
+    finally:
+        conn.close()

@@ -1,0 +1,294 @@
+"""
+execution/db/sqlite.py
+
+SQLite helper module for deterministic local persistence.
+Provides only infrastructure: path resolution, connection setup, and schema initialization.
+No business logic lives here.
+"""
+
+import os
+import sqlite3
+from pathlib import Path
+
+
+def get_db_path() -> str:
+    """Return the absolute path to the local SQLite database file.
+
+    The file lives under the repo's /tmp folder (which is safe to delete
+    and is never committed). Creates the directory if it does not exist.
+
+    Returns:
+        str: Absolute path to tmp/app.db relative to the repo root.
+    """
+    repo_root = Path(__file__).resolve().parents[2]  # execution/db/sqlite.py -> repo root
+    tmp_dir = repo_root / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return str(tmp_dir / "app.db")
+
+
+def connect(db_path: str | None = None) -> sqlite3.Connection:
+    """Open and return a sqlite3 connection with foreign key enforcement enabled.
+
+    Args:
+        db_path: Path to the SQLite file. Defaults to the result of get_db_path().
+
+    Returns:
+        sqlite3.Connection: An open connection with PRAGMA foreign_keys = ON.
+    """
+    if db_path is None:
+        db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.row_factory = sqlite3.Row  # rows accessible by column name
+    return conn
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    """Create all application tables if they do not already exist.
+
+    Safe to call multiple times (uses CREATE TABLE IF NOT EXISTS).
+    Does not drop or migrate existing tables.
+
+    Schema:
+        leads                 — core person record
+        course_invites        — records that a "Free Intro to AI Class" invite was sent
+        progress_events       — individual progress updates (phase/section level)
+        course_state          — computed current position and completion for a lead
+        hot_lead_signals      — derived readiness-for-booking indicator (rule-based)
+        sync_records          — outbox audit log for GHL push attempts (future use)
+        reflection_responses  — student free-text reflection answers per section/prompt
+
+    Args:
+        conn: An open sqlite3.Connection (foreign keys should already be ON).
+    """
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS leads (
+            id              TEXT PRIMARY KEY,
+            phone           TEXT,
+            email           TEXT,
+            name            TEXT,
+            ghl_contact_id  TEXT,
+            created_at      TEXT,
+            updated_at      TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS course_enrollments (
+            id          TEXT PRIMARY KEY,
+            lead_id     TEXT NOT NULL,
+            course_id   TEXT NOT NULL DEFAULT 'FREE_INTRO_AI_V0',
+            enrolled_at TEXT,
+            status      TEXT NOT NULL DEFAULT 'active',
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
+            FOREIGN KEY (lead_id) REFERENCES leads (id),
+            UNIQUE (lead_id, course_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS course_invites (
+            id             TEXT PRIMARY KEY,
+            lead_id        TEXT NOT NULL,
+            course_id      TEXT NOT NULL DEFAULT 'FREE_INTRO_AI_V0',
+            generated_at   TEXT,
+            sent_at        TEXT,
+            channel        TEXT,
+            token          TEXT,
+            first_used_at  TEXT,
+            metadata_json  TEXT,
+            FOREIGN KEY (lead_id) REFERENCES leads (id)
+        );
+
+        CREATE TABLE IF NOT EXISTS progress_events (
+            id            TEXT PRIMARY KEY,
+            lead_id       TEXT NOT NULL,
+            course_id     TEXT NOT NULL DEFAULT 'FREE_INTRO_AI_V0',
+            section       TEXT,
+            occurred_at   TEXT,
+            metadata_json TEXT,
+            FOREIGN KEY (lead_id) REFERENCES leads (id)
+        );
+
+        CREATE TABLE IF NOT EXISTS course_state (
+            lead_id          TEXT NOT NULL,
+            course_id        TEXT NOT NULL DEFAULT 'FREE_INTRO_AI_V0',
+            current_section  TEXT,
+            completion_pct   REAL,
+            last_activity_at TEXT,
+            started_at       TEXT,
+            updated_at       TEXT,
+            PRIMARY KEY (lead_id, course_id),
+            FOREIGN KEY (lead_id) REFERENCES leads (id)
+        );
+
+        CREATE TABLE IF NOT EXISTS hot_lead_signals (
+            lead_id    TEXT PRIMARY KEY,
+            signal     TEXT,
+            score      REAL,
+            reason     TEXT,
+            updated_at TEXT,
+            FOREIGN KEY (lead_id) REFERENCES leads (id)
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_records (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id       TEXT NOT NULL,
+            destination   TEXT NOT NULL,
+            status        TEXT NOT NULL,
+            reason        TEXT,
+            payload_json  TEXT,
+            response_json TEXT,
+            error         TEXT,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL,
+            FOREIGN KEY (lead_id) REFERENCES leads (id) ON DELETE CASCADE,
+            UNIQUE (lead_id, destination, status)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sync_records_status
+            ON sync_records (status);
+
+        CREATE INDEX IF NOT EXISTS idx_sync_records_lead_id
+            ON sync_records (lead_id);
+
+        CREATE TABLE IF NOT EXISTS reflection_responses (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id       TEXT NOT NULL,
+            course_id     TEXT NOT NULL,
+            section_id    TEXT NOT NULL,
+            prompt_index  INTEGER NOT NULL,
+            response_text TEXT NOT NULL,
+            created_at    TEXT,
+            UNIQUE (lead_id, course_id, section_id, prompt_index)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_reflection_lead_course
+            ON reflection_responses (lead_id, course_id);
+
+        CREATE TABLE IF NOT EXISTS lead_final_scores (
+            lead_id        TEXT NOT NULL,
+            course_id      TEXT NOT NULL DEFAULT 'FREE_INTRO_AI_V0',
+            final_label    TEXT NOT NULL,
+            final_score    INTEGER,
+            finalized_at   TEXT NOT NULL,
+            PRIMARY KEY (lead_id, course_id),
+            FOREIGN KEY (lead_id) REFERENCES leads (id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_lead_final_scores_label
+            ON lead_final_scores (final_label);
+    """)
+    conn.commit()
+
+    # ---------------------------------------------------------------------------
+    # Idempotent column migrations — add new columns to course_invites for
+    # existing databases.
+    #
+    # CREATE TABLE IF NOT EXISTS only runs on brand-new databases; existing
+    # databases won't pick up new columns from it.  Each block below detects
+    # whether a column is missing and adds it safely.  Running multiple times is
+    # harmless: every ADD COLUMN is inside an existence check and the index uses
+    # CREATE ... IF NOT EXISTS.
+    # ---------------------------------------------------------------------------
+    existing_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(course_invites)").fetchall()
+    }
+    if "token" not in existing_columns:
+        conn.execute("ALTER TABLE course_invites ADD COLUMN token TEXT")
+        conn.commit()
+
+    if "first_used_at" not in existing_columns:
+        conn.execute("ALTER TABLE course_invites ADD COLUMN first_used_at TEXT")
+        conn.commit()
+
+    if "course_id" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE course_invites "
+            "ADD COLUMN course_id TEXT NOT NULL DEFAULT 'FREE_INTRO_AI_V0'"
+        )
+        conn.commit()
+
+    if "generated_at" not in existing_columns:
+        conn.execute("ALTER TABLE course_invites ADD COLUMN generated_at TEXT")
+        conn.commit()
+
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_course_invites_token "
+        "ON course_invites (token)"
+    )
+    conn.commit()
+
+    # ---------------------------------------------------------------------------
+    # Idempotent column migration — add course_id to progress_events for
+    # existing databases that were created before this column was introduced.
+    # ---------------------------------------------------------------------------
+    existing_pe_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(progress_events)").fetchall()
+    }
+    if "course_id" not in existing_pe_columns:
+        conn.execute(
+            "ALTER TABLE progress_events "
+            "ADD COLUMN course_id TEXT NOT NULL DEFAULT 'FREE_INTRO_AI_V0'"
+        )
+        conn.commit()
+
+    # ---------------------------------------------------------------------------
+    # Structural migration — promote course_state from one-row-per-lead to
+    # one-row-per-(lead_id, course_id).
+    #
+    # SQLite does not support ALTER TABLE ... DROP PRIMARY KEY or ADD PRIMARY KEY,
+    # so the only safe path is a table recreation.  The idempotency guard checks
+    # for the presence of the course_id column; once it exists the block is
+    # skipped on every subsequent init_db() call.
+    #
+    # Safety notes:
+    #   • DROP TABLE IF EXISTS course_state_new first to clean up any leftover
+    #     from a previously interrupted migration.
+    #   • All existing rows are assigned course_id = 'FREE_INTRO_AI_V0' which is
+    #     correct because all historical data belongs to that course.
+    #   • executescript() issues an implicit COMMIT before running, so the
+    #     statements execute in auto-commit mode — each is individually durable.
+    # ---------------------------------------------------------------------------
+    existing_cs_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(course_state)").fetchall()
+    }
+    if "course_id" not in existing_cs_columns:
+        conn.execute("DROP TABLE IF EXISTS course_state_new")
+        conn.commit()
+        conn.executescript("""
+            CREATE TABLE course_state_new (
+                lead_id          TEXT NOT NULL,
+                course_id        TEXT NOT NULL DEFAULT 'FREE_INTRO_AI_V0',
+                current_section  TEXT,
+                completion_pct   REAL,
+                last_activity_at TEXT,
+                started_at       TEXT,
+                updated_at       TEXT,
+                PRIMARY KEY (lead_id, course_id),
+                FOREIGN KEY (lead_id) REFERENCES leads (id)
+            );
+
+            INSERT INTO course_state_new
+                (lead_id, course_id, current_section, completion_pct,
+                 last_activity_at, started_at, updated_at)
+            SELECT
+                lead_id, 'FREE_INTRO_AI_V0', current_section, completion_pct,
+                last_activity_at, started_at, updated_at
+            FROM course_state;
+
+            DROP TABLE course_state;
+            ALTER TABLE course_state_new RENAME TO course_state;
+        """)
+
+    # ---------------------------------------------------------------------------
+    # Idempotent column migration — add ghl_contact_id to leads for existing
+    # databases that were created before this column was introduced.
+    # ---------------------------------------------------------------------------
+    existing_leads_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(leads)").fetchall()
+    }
+    if "ghl_contact_id" not in existing_leads_columns:
+        conn.execute("ALTER TABLE leads ADD COLUMN ghl_contact_id TEXT")
+        conn.commit()

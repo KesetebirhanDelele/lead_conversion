@@ -1,0 +1,30 @@
+[
+  {
+    "quiz_id": "quiz_phase5_mod5_1",
+    "title": "Next Steps in AI — Check",
+    "questions": [
+      {
+        "question": "Which of the following is a good first step after completing an introductory AI course?",
+        "options": [
+          "Designing a nuclear reactor",
+          "Building a small personal project to apply what you learned",
+          "Immediately publishing research papers",
+          "Deleting all your notes"
+        ],
+        "correct_index": 1,
+        "hint": "Applying what you've learned in a hands-on project tends to cement understanding more than reading more theory alone."
+      },
+      {
+        "question": "Which resource is most useful for practicing machine learning hands-on?",
+        "options": [
+          "A thesaurus",
+          "A Kaggle competition dataset",
+          "A cable TV subscription",
+          "A printed map"
+        ],
+        "correct_index": 1,
+        "hint": "Look for the option that gives you real datasets and a community where you can practice building and evaluating models."
+      }
+    ]
+  }
+]

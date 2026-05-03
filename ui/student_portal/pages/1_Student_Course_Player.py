@@ -1,0 +1,2381 @@
+"""
+ui/student_portal/pages/1_Student_Course_Player.py
+
+Student Course Player — guided sequential flow (Flow Engine v1).
+Directive: directives/UI_STUDENT_COURSE_PLAYER.md
+
+Run from the repository root:
+    streamlit run ui/student_portal/student_app.py
+"""
+
+import json
+import logging
+import os
+import re
+import sqlite3
+import time
+import uuid
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import streamlit as st
+
+# ---------------------------------------------------------------------------
+# sys.path bootstrap — this file lives three levels below repo root
+# (ui/student_portal/pages/).
+# ---------------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from execution.course.course_registry import SECTIONS, TOTAL_SECTIONS               # noqa: E402
+from execution.course.load_course_map import load_course_map                        # noqa: E402
+from execution.course.load_quiz_library import load_quiz_library                    # noqa: E402
+from execution.leads.get_lead_status import get_lead_status                         # noqa: E402
+from execution.leads.upsert_lead import upsert_lead                                 # noqa: E402
+from execution.progress.compute_course_state import compute_course_state            # noqa: E402
+from execution.progress.finalize_on_completion import finalize_on_completion        # noqa: E402
+from execution.progress.record_progress_event import record_progress_event          # noqa: E402
+from execution.decision.get_cora_recommendation import get_cora_recommendation       # noqa: E402
+from execution.events.send_course_event import send_course_event                    # noqa: E402
+from execution.reflection.load_reflection_responses import load_reflection_responses  # noqa: E402
+from execution.reflection.save_reflection_response import save_reflection_response   # noqa: E402
+from execution.ghl.write_ghl_contact_fields import write_ghl_contact_fields          # noqa: E402
+from ui.theme import apply_colaberry_theme                                          # noqa: E402
+from ui.student_portal.ai_tutor import generate_tutor_reply                         # noqa: E402
+from ui.student_portal._player_debug import log as _dbg_log, snap as _dbg_snap, enabled as _dbg_enabled  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+DB_PATH = str(REPO_ROOT / "tmp" / "app.db")
+COURSE_CONTENT_DIR = REPO_ROOT / "course_content" / "FREE_INTRO_AI_V0"
+COURSE_ID = "FREE_INTRO_AI_V0"
+COURSE_EVENT_WEBHOOK_URL: str | None = os.environ.get("COURSE_EVENT_WEBHOOK_URL")
+GHL_API_URL: str | None = os.environ.get("GHL_API_URL")
+EM_DASH = "\u2014"
+
+
+# ── Hydration helper ──────────────────────────────────────────────────────────
+def _hydrate_completed_from_status(status: dict | None) -> None:
+    """Merge DB-completed sections into player_completed.
+
+    Some status payloads don't include explicit completed section IDs; in that
+    case, synthesize a completion prefix from completion_pct (best-effort).
+    """
+    try:
+        done = _status_completed_sections(status)
+
+        # Fallback: synthesize consecutive completed prefix from completion_pct.
+        if not done:
+            try:
+                if status and status.get("lead_exists"):
+                    cs = status.get("course_state") or {}
+                    pct = cs.get("completion_pct")
+                    if pct is not None:
+                        total = max(1, len(SECTIONS))
+                        completed_count = max(0, min(total, int(round((float(pct) / 100.0) * total))))
+                        done = {sid for sid, _t in SECTIONS[:completed_count]}
+            except Exception:
+                pass
+
+        if done:
+            st.session_state["player_completed"] |= set(done)
+    except Exception:
+        pass
+
+
+def _clamp_section_idx(idx: int) -> int:
+    return max(0, min(len(SECTIONS) - 1, int(idx)))
+
+
+# ── DB reset helpers ───────────────────────────────────────────────────────────
+
+_BACKNAV_AUDIT_DDL = """
+CREATE TABLE IF NOT EXISTS backnav_audit (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id         TEXT    NOT NULL,
+    from_section_id TEXT,
+    to_section_id   TEXT,
+    from_idx        INTEGER,
+    to_idx          INTEGER,
+    occurred_at     TEXT    NOT NULL,
+    metadata_json   TEXT
+)"""
+
+
+def _reset_db_progress_from_idx(lead_id: str, from_idx: int, to_idx: int) -> None:
+    """Reset DB progress for a back-navigation confirm.
+
+    Deletes progress_events and reflection_responses for sections at to_idx and
+    beyond (the student will redo those), then directly updates course_state so
+    current_section points to the target and completion_pct reflects the
+    remaining prefix. Creates backnav_audit if missing and logs one row.
+
+    Schema note (actual DB):
+      progress_events  — column is "section"  (not section_id)
+      reflection_responses — column is "section_id"
+      course_state     — separate table (not a JSON blob in leads)
+
+    Args:
+        lead_id:  Lead whose progress is being reset.
+        from_idx: Furthest confirmed section index before the reset (for audit).
+        to_idx:   Target section index the student is jumping back to.
+    """
+    if not lead_id:
+        return
+    sections_to_delete = [sid for sid, _t in SECTIONS[to_idx:]]
+    target_sid = SECTIONS[to_idx][0] if to_idx < len(SECTIONS) else None
+    from_sid   = SECTIONS[from_idx][0] if 0 <= from_idx < len(SECTIONS) else None
+    now_iso    = datetime.now(timezone.utc).isoformat()
+    try:
+        conn = connect(DB_PATH)
+
+        if sections_to_delete:
+            ph = ", ".join("?" for _ in sections_to_delete)
+            # progress_events uses column "section" (singular, no _id suffix)
+            conn.execute(
+                f"DELETE FROM progress_events WHERE lead_id = ? AND section IN ({ph})",
+                [lead_id, *sections_to_delete],
+            )
+            # reflection_responses uses column "section_id"
+            conn.execute(
+                f"DELETE FROM reflection_responses WHERE lead_id = ? AND section_id IN ({ph})",
+                [lead_id, *sections_to_delete],
+            )
+
+        # Recompute completion from whatever events remain.
+        remaining = conn.execute(
+            "SELECT section, occurred_at FROM progress_events "
+            "WHERE lead_id = ? ORDER BY occurred_at ASC",
+            [lead_id],
+        ).fetchall()
+        total = max(1, len(SECTIONS))
+        if remaining:
+            distinct_count = len({row[0] for row in remaining})
+            last_activity  = remaining[-1][1]
+            completion_pct = (distinct_count / total) * 100.0
+        else:
+            distinct_count = 0
+            last_activity  = None
+            completion_pct = 0.0
+
+        # course_state is a real table — update or insert directly.
+        existing = conn.execute(
+            "SELECT lead_id FROM course_state WHERE lead_id = ?", [lead_id]
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE course_state "
+                "SET current_section=?, completion_pct=?, last_activity_at=?, updated_at=? "
+                "WHERE lead_id=?",
+                [target_sid, completion_pct, last_activity, now_iso, lead_id],
+            )
+        else:
+            conn.execute(
+                "INSERT INTO course_state "
+                "(lead_id, current_section, completion_pct, last_activity_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [lead_id, target_sid, completion_pct, last_activity, now_iso],
+            )
+
+        # Commit the reset (DELETE + UPDATE) before attempting the audit
+        # INSERT.  If the audit fails for any reason the reset is already
+        # durable — a failed audit will no longer roll back the deletion and
+        # course_state update that the caller depends on.
+        conn.commit()
+
+        # Log the reset to the audit table (best-effort; non-critical).
+        try:
+            conn.execute(
+                "INSERT INTO backnav_audit "
+                "(lead_id, from_section_id, to_section_id, from_idx, to_idx, occurred_at, metadata_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    lead_id, from_sid, target_sid, from_idx, to_idx, now_iso,
+                    json.dumps({"reason": "user_backnav_confirm", "ui": "student_course_player"}),
+                ],
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+        conn.close()
+    except Exception:
+        pass
+
+
+def _lead_has_invite(lead_id: str) -> bool:
+    """Return True when lead_id has at least one course invite on record.
+
+    Used to gate manual-entry access: students without an invite cannot
+    record progress.  Token-resolved users always have an invite (their
+    lead_id comes directly from course_invites), so this check passes
+    transparently for them.
+    """
+    if not lead_id:
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT id FROM course_invites WHERE lead_id = ? LIMIT 1",
+            (lead_id,),
+        ).fetchone()
+        conn.close()
+        return row is not None
+    except Exception:
+        return False
+
+
+# ── Progress helpers ──────────────────────────────────────────────────────────
+def _status_completed_sections(status: dict | None) -> set[str]:
+    """Extract completed section IDs from a get_lead_status payload (best-effort)."""
+    if not status or not status.get("lead_exists"):
+        return set()
+    cs = status.get("course_state") or {}
+    out: set[str] = set()
+    for c in [
+        cs.get("completed_sections"), cs.get("completed"),
+        status.get("completed_sections"), status.get("completed"),
+    ]:
+        if isinstance(c, (list, tuple, set)):
+            out |= {str(x) for x in c}
+        elif isinstance(c, dict):
+            out |= {str(k) for k, v in c.items() if v is True}
+    return out
+
+
+def _allowed_max_idx(completed: set[str]) -> int:
+    """Furthest section index accessible = length of consecutive completion prefix from 0."""
+    sid_to_idx = {sid: i for i, (sid, _t) in enumerate(SECTIONS)}
+    completed_idxs = {sid_to_idx[sid] for sid in completed if sid in sid_to_idx}
+    prefix_len = 0
+    while prefix_len < len(SECTIONS) and prefix_len in completed_idxs:
+        prefix_len += 1
+    return min(prefix_len, len(SECTIONS) - 1)
+
+
+def _completion_prefix_idx_from_status(status: dict | None) -> int:
+    """Fallback unlock/resume frontier derived from completion_pct.
+
+    Example: 22.22% with 9 sections => round(0.2222 * 9) = 2 => index 2 is the frontier.
+    """
+    try:
+        if not status or not status.get("lead_exists"):
+            return 0
+        cs = status.get("course_state") or {}
+        pct = cs.get("completion_pct")
+        if pct is None:
+            return 0
+        completed_count = int(round((float(pct) / 100.0) * max(1, len(SECTIONS))))
+        return max(0, min(len(SECTIONS) - 1, completed_count))
+    except Exception:
+        return 0
+
+
+def _unlocked_frontier_idx(completed: set[str], status: dict | None) -> int:
+    """Combine explicit completions + DB completion_pct fallback for the best resume point."""
+    return max(_allowed_max_idx(completed), _completion_prefix_idx_from_status(status))
+
+
+# Human-readable question text for each reflection prompt identifier.
+_PROMPT_QUESTIONS: dict[str, str] = {
+    "confidence_start": (
+        "How confident were you about AI before starting this section? Describe your starting point."
+    ),
+    "early_surprise": "What surprised you most in this section?",
+    "motivation": "What is motivating you to learn about AI?",
+    "interest_area": "Which area of AI interests you most so far, and why?",
+    "confidence_current": "How has your understanding or confidence changed after this section?",
+    "real_world_interest": "Which real-world AI application interests you most? Why?",
+    "data_to_decision_reflection": (
+        "How do you see data being used to make better decisions in your life or work?"
+    ),
+    "intent_level": (
+        "How likely are you to continue learning AI after this course? "
+        "What factors are influencing you?"
+    ),
+    "preferred_path": (
+        "What learning path feels most right for you next — "
+        "hands-on projects, structured courses, or something else?"
+    ),
+    "open_reflection": (
+        "Is there anything else you want to capture about your learning journey so far?"
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Cached course data loaders — file I/O runs once per session.
+# ---------------------------------------------------------------------------
+@st.cache_data
+def _cached_course_map() -> dict:
+    return load_course_map(COURSE_ID)
+
+
+@st.cache_data
+def _cached_quiz_library() -> dict:
+    return load_quiz_library(COURSE_ID)
+
+
+# ---------------------------------------------------------------------------
+# Markdown chunker — pure, deterministic, no randomness, stdlib only.
+# ---------------------------------------------------------------------------
+
+def _chunk_markdown(text: str) -> list[str]:
+    """Split markdown into deterministic chunks for the guided lesson flow.
+
+    Strategy 1 — heading split: each H1/H2/H3 heading plus its body becomes
+    one chunk.  Requires ≥ 2 headings to activate (single-heading docs fall
+    through to Strategy 2).
+
+    Strategy 2 — paragraph groups: blank-line-separated paragraphs are
+    collected and merged into at most 5 evenly-sized chunks.
+
+    Returns at least one non-empty string.  Pure function; no I/O, no imports
+    beyond stdlib re (already imported at module level).
+    """
+    text = text.replace("\r\n", "\n").strip()
+    if not text:
+        return [""]
+
+    # Strategy 1: insert a NUL sentinel before every heading line, then split.
+    _SENTINEL = "\x00CHUNK\x00"
+    marked = re.sub(r"^(#{1,3} )", _SENTINEL + r"\1", text, flags=re.MULTILINE)
+    parts = [p.strip() for p in marked.split(_SENTINEL) if p.strip()]
+    if len(parts) >= 2:
+        return parts
+
+    # Strategy 2: blank-line paragraph groups, capped at 5 chunks.
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    n = len(paragraphs)
+    if n <= 5:
+        return paragraphs or [text]
+    target = 5
+    size = (n + target - 1) // target  # ceiling division for even distribution
+    chunks = ["\n\n".join(paragraphs[i : i + size]) for i in range(0, n, size)]
+    return [c for c in chunks if c]
+
+
+# ---------------------------------------------------------------------------
+# Page config — must be the first Streamlit call in the file.
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="Student Course Player", layout="wide")
+apply_colaberry_theme("Student Portal", "Free Intro to AI", show_header=False)
+
+st.markdown(
+    """
+    <style>
+    /* ── Main content container ───────────────────────────────────────────────
+       Single authoritative rule: 900 px cap, centered, responsive gutters.
+       No competing .main rule above it.
+    ── */
+    section.main .block-container {
+        max-width: 900px !important;
+        margin-left: auto !important;
+        margin-right: auto !important;
+        padding-top: 0 !important;
+        padding-left: 1.5rem !important;
+        padding-right: 1.5rem !important;
+        padding-bottom: 3rem !important;
+    }
+    @media (max-width: 640px) {
+        section.main .block-container {
+            padding-left: 0.75rem !important;
+            padding-right: 0.75rem !important;
+        }
+    }
+
+    /* ── Sticky section header bar ────────────────────────────────────────── */
+    .cb-topbar {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        background: rgba(255, 255, 255, 0.97);
+        backdrop-filter: blur(6px);
+        border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+        padding: 0.4rem 0 0.35rem;
+        margin-bottom: 0.75rem;
+    }
+    .cb-topbar-caption {
+        font-size: 0.7rem;
+        color: #5B5A59;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        margin: 0 0 4px;
+    }
+    .cb-topbar-title {
+        font-size: 1.35rem;
+        font-weight: 800;
+        color: #0D0D0D;
+        margin: 0 0 5px;
+        line-height: 1.25;
+    }
+    .cb-topbar-step {
+        font-size: 0.72rem;
+        font-weight: 500;
+        color: #497095;
+        letter-spacing: 0.02em;
+        margin: 0;
+    }
+
+    /* ── Section progress bar spacing ────────────────────────────────────── */
+    .stProgress { margin-top: 0.4rem; margin-bottom: 0.5rem; }
+
+    /* ── Progress meta caption ────────────────────────────────────────────── */
+    .cb-progress-meta {
+        font-size: 0.75rem;
+        color: #5B5A59;
+        margin: 0 0 1.25rem;
+        line-height: 1.4;
+    }
+
+    /* ── Reading column: full width of the 900 px shell ─────────────────── */
+    .cb-card-inner { max-width: 100%; margin: 0 auto; }
+    .cb-card-inner p { line-height: 1.75; font-size: 1rem; }
+
+    /* ── Lesson content card ──────────────────────────────────────────────
+       .cb-content-card is the canonical class; the data-testid selector
+       applies it to Streamlit's st.container(border=True) wrapper so no
+       Python structure changes are needed.
+    ── */
+    .cb-content-card,
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        background: #ffffff !important;
+        border-radius: 12px !important;
+        border: 1px solid rgba(0, 0, 0, 0.08) !important;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06) !important;
+        padding: 1.5rem 1.75rem !important;
+    }
+    @media (max-width: 640px) {
+        .cb-content-card,
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            border-radius: 8px !important;
+            padding: 1rem 1rem !important;
+        }
+    }
+
+    /* ── Nav row (back / forward buttons) ────────────────────────────────── */
+    .cb-nav-row { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+
+    /* ── Course completion hero card ──────────────────────────────────────── */
+    .cb-complete-hero {
+        background: #f6faf7;
+        border: 1px solid #c3dfc9;
+        border-radius: 12px;
+        padding: 1.75rem 2rem;
+        margin: 0.5rem 0 1.5rem;
+    }
+    .cb-complete-eyebrow {
+        font-size: 0.68rem;
+        font-weight: 700;
+        letter-spacing: 0.11em;
+        text-transform: uppercase;
+        color: #2e7d52;
+        margin: 0 0 0.45rem;
+    }
+    .cb-complete-title {
+        font-size: 1.65rem;
+        font-weight: 800;
+        color: #0D0D0D;
+        margin: 0 0 0.85rem;
+        line-height: 1.2;
+    }
+    .cb-complete-body {
+        font-size: 0.93rem;
+        color: #374151;
+        margin: 0 0 1.25rem;
+        line-height: 1.65;
+    }
+    .cb-complete-covered {
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        color: #5B5A59;
+        margin: 0 0 0.5rem;
+    }
+    .cb-complete-items {
+        margin: 0;
+        padding-left: 0;
+        list-style: none;
+    }
+    .cb-complete-items li {
+        font-size: 0.875rem;
+        color: #4B5563;
+        padding: 0.2rem 0;
+        line-height: 1.5;
+    }
+
+    /* ── Section welcome hero ──────────────────────────────────────────────── */
+    .cb-section-hero {
+        background: #fafafa;
+        border: 1px solid rgba(0,0,0,0.07);
+        border-top: 3px solid #EB3537;
+        border-radius: 12px;
+        padding: 2rem 2.25rem 1.75rem;
+        text-align: center;
+        margin-bottom: 0.5rem;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    }
+    .cb-section-hero-eyebrow {
+        font-size: 0.68rem;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: #5B5A59;
+        margin: 0 0 1rem;
+        text-align: center;
+    }
+    .cb-section-hero-icon {
+        font-size: 2.75rem;
+        line-height: 1;
+        margin: 0 0 0.85rem;
+    }
+    .cb-section-hero-title {
+        font-size: 2rem;
+        font-weight: 800;
+        color: #0D0D0D;
+        margin: 0 0 0.75rem;
+        line-height: 1.15;
+        text-align: center;
+    }
+    .cb-section-hero-subtitle {
+        font-size: 1.05rem;
+        color: #374151;
+        max-width: 520px;
+        margin: 0 0 1.5rem;
+        line-height: 1.6;
+        text-align: center;
+    }
+    .cb-section-hero-pills {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .cb-section-hero-pill {
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: #497095;
+        background: #EEF3F8;
+        border-radius: 20px;
+        padding: 0.3rem 0.8rem;
+    }
+    .cb-section-hero-arrow {
+        font-size: 0.78rem;
+        color: #9CA3AF;
+        font-weight: 500;
+    }
+
+    /* ── Section recap card ─────────────────────────────────────────────── */
+    .cb-recap-card {
+        background: #F8F9FA;
+        border: 1px solid rgba(0,0,0,0.06);
+        border-radius: 10px;
+        padding: 1rem 1.2rem;
+        margin: 0 0 0.75rem;
+    }
+    .cb-recap-eyebrow {
+        font-size: 0.65rem;
+        font-weight: 700;
+        letter-spacing: 0.11em;
+        text-transform: uppercase;
+        color: #5B5A59;
+        margin: 0 0 0.4rem;
+    }
+    .cb-recap-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: #0D0D0D;
+        margin: 0 0 0.35rem;
+    }
+    .cb-recap-body {
+        font-size: 0.88rem;
+        color: #4B5563;
+        margin: 0;
+        line-height: 1.55;
+    }
+
+    /* ── Next-section unlock banner ─────────────────────────────────────── */
+    .cb-unlock-banner {
+        display: flex;
+        align-items: center;
+        gap: 0.85rem;
+        background: #f0f7f1;
+        border: 1px solid #b7d9bc;
+        border-left: 4px solid #2e7d52;
+        border-radius: 10px;
+        padding: 0.9rem 1.1rem;
+        margin: 0 0 0.9rem;
+    }
+    .cb-unlock-icon {
+        font-size: 1.35rem;
+        flex-shrink: 0;
+        line-height: 1;
+    }
+    .cb-unlock-eyebrow {
+        font-size: 0.65rem;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: #2e7d52;
+        margin: 0 0 0.15rem;
+    }
+    .cb-unlock-title {
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #0D0D0D;
+        margin: 0;
+    }
+
+    /* ── Hide heading anchor links (not student-facing) ─────────────────── */
+    h1 a, h2 a, h3 a { display: none !important; }
+
+    /* ── Hide Streamlit's auto-generated sidebar page nav ────────────────── */
+    [data-testid="stSidebarNav"] { display: none !important; }
+
+    /* ── Sidebar section states ─────────────────────────────────────────────── */
+    /* Non-selected: gentle dimming (same rule applies to locked, completed, not-started) */
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:not(:has(input:checked)) {
+        opacity: 0.78;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:not(:has(input:checked)):hover {
+        opacity: 0.95;
+    }
+    /* Selected / in-progress: subtle slate-blue tint */
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {
+        background: rgba(73, 112, 149, 0.1);
+        border-radius: 8px;
+    }
+    /* Status badge line: markdown *text* → <em>; smaller, muted, not italic */
+    [data-testid="stSidebar"] [data-testid="stRadio"] label em {
+        font-size: 0.68rem;
+        font-style: normal;
+        opacity: 0.6;
+        letter-spacing: 0.01em;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------------------------
+# Per-rerun correlation ID — new value on every Streamlit rerun.
+# ---------------------------------------------------------------------------
+_RUN_ID: str = uuid.uuid4().hex[:8]
+
+# ── Micro-celebration message pools ──────────────────────────────────────────
+# Outer index: active_idx % 3  → one of 3 section-cycle buckets (0, 1, 2).
+# Inner index: item number     → rotates within that bucket deterministically.
+# No randomness. Shared across all 9 sections.
+_QUIZ_MSGS: tuple[tuple[tuple[str, str], ...], ...] = (
+    # bucket 0 — sections 1, 4, 7  (active_idx % 3 == 0)
+    (("Correct — keep going.", "✅"), ("That's it.", "✅")),
+    # bucket 1 — sections 2, 5, 8  (active_idx % 3 == 1)
+    (("You've got it.", "✅"), ("Right there.", "✅")),
+    # bucket 2 — sections 3, 6, 9  (active_idx % 3 == 2)
+    (("Exactly right.", "✅"), ("Right. Keep moving.", "✅")),
+)
+_REFL_MSGS: tuple[tuple[tuple[str, str], ...], ...] = (
+    # bucket 0 — sections 1, 4, 7  (active_idx % 3 == 0)
+    (("Saved. Good thinking.", "✍️"), ("Noted.", "✍️")),
+    # bucket 1 — sections 2, 5, 8  (active_idx % 3 == 1)
+    (("Good — keep reflecting.", "✍️"), ("Noted. Keep going.", "✍️")),
+    # bucket 2 — sections 3, 6, 9  (active_idx % 3 == 2)
+    (("Saved.", "✍️"), ("Captured. Keep going.", "✍️")),
+)
+
+# ---------------------------------------------------------------------------
+# Session state initialisation
+# ---------------------------------------------------------------------------
+if "player_completed" not in st.session_state:
+    st.session_state["player_completed"] = set()
+if "player_lead_id" not in st.session_state:
+    st.session_state["player_lead_id"] = ""
+if "player_status" not in st.session_state:
+    st.session_state["player_status"] = None
+if "player_flash" not in st.session_state:
+    st.session_state["player_flash"] = None  # (level, message) or None
+if "player_toast" not in st.session_state:
+    st.session_state["player_toast"] = None  # (message, icon) or None
+if "tutor_history" not in st.session_state:
+    st.session_state["tutor_history"] = {}    # dict[lead_id -> list[{"role": str, "content": str}]]
+if "tutor_lead_id" not in st.session_state:
+    st.session_state["tutor_lead_id"] = None  # active lead for history routing
+if "tutor_section_id" not in st.session_state:
+    st.session_state["tutor_section_id"] = None  # tracks section for per-lead history reset
+if "quiz_submitted" not in st.session_state:
+    st.session_state["quiz_submitted"] = set()  # set of "{section_id}:{quiz_id}"
+# Flow Engine v1 — guided sequential step state.
+if "player_course_started" not in st.session_state:
+    st.session_state["player_course_started"] = False  # True after Begin Course clicked
+if "player_flow_step" not in st.session_state:
+    st.session_state["player_flow_step"] = "welcome"   # welcome|lesson|quiz|reflection|complete
+if "player_flow_chunk_idx" not in st.session_state:
+    st.session_state["player_flow_chunk_idx"] = 0      # current lesson chunk index
+if "player_flow_section_id" not in st.session_state:
+    st.session_state["player_flow_section_id"] = None  # tracks section for flow reset
+# Step 2B — per-question quiz and per-prompt reflection indices.
+if "player_quiz_idx" not in st.session_state:
+    st.session_state["player_quiz_idx"] = 0          # index into section_quiz_ids
+if "player_quiz_q_idx" not in st.session_state:
+    st.session_state["player_quiz_q_idx"] = 0        # index into quiz["questions"]
+if "player_quiz_attempts" not in st.session_state:
+    st.session_state["player_quiz_attempts"] = {}    # {qk: attempt_count}
+if "player_quiz_correct" not in st.session_state:
+    st.session_state["player_quiz_correct"] = set()  # set of correct question keys
+if "player_refl_idx" not in st.session_state:
+    st.session_state["player_refl_idx"] = 0          # index into section_prompt_ids
+# Back-nav tracking: furthest section the student has confirmed reaching.
+if "_section_radio_confirmed" not in st.session_state:
+    st.session_state["_section_radio_confirmed"] = 0
+if "_backnav_pending_idx" not in st.session_state:
+    _dbg_log(
+        "backnav_pending_set",
+        reason="init", new_value=None, active_idx=None,
+        confirmed_idx=st.session_state.get("_section_radio_confirmed"),
+        section_radio=st.session_state.get("_section_radio"),
+        section_radio_pending=st.session_state.get("_section_radio_pending"),
+        section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+        suppress_once=st.session_state.get("_suppress_backnav_once"),
+        last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+    )
+    st.session_state["_backnav_pending_idx"] = None
+# Suppress false back-nav intercept on internal forward navigation reruns.
+if "_suppress_backnav_once" not in st.session_state:
+    st.session_state["_suppress_backnav_once"] = False
+if "_last_sidebar_idx" not in st.session_state:
+    st.session_state["_last_sidebar_idx"] = 0
+if "_section_radio_user_changed" not in st.session_state:
+    st.session_state["_section_radio_user_changed"] = False
+
+# ---------------------------------------------------------------------------
+# Back-nav diagnostic trace helper (temporary instrumentation)
+# ---------------------------------------------------------------------------
+def _trace_backnav(tag: str) -> None:
+    _dbg_log(
+        "backnav_trace",
+        tag=tag,
+        backnav_pending_idx=st.session_state.get("_backnav_pending_idx"),
+        section_radio=st.session_state.get("_section_radio"),
+        section_radio_confirmed=st.session_state.get("_section_radio_confirmed"),
+        section_radio_pending=st.session_state.get("_section_radio_pending"),
+        last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+        suppress_backnav_once=st.session_state.get("_suppress_backnav_once"),
+        state=_dbg_snap(st.session_state),
+    )
+
+
+def _on_section_radio_change():
+    # Guard: programmatic rerun / pending-apply in progress — ignore callback.
+    if bool(st.session_state.get("_suppress_backnav_once", False)):
+        st.session_state["_section_radio_user_changed"] = False
+        _dbg_log(
+            "section_radio_on_change_ignored",
+            reason="suppress_backnav_once",
+            raw_value=st.session_state.get("_section_radio"),
+            pending=st.session_state.get("_section_radio_pending"),
+            confirmed=st.session_state.get("_section_radio_confirmed"),
+            last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+        )
+        return
+
+    # Streamlit may store an int index OR a formatted string label (e.g. "▶ How Machines Learn").
+    # Robustly convert whichever form is present back to an integer index.
+    _LABEL_PREFIXES = ("\u2705 ", "\U0001f512 ", "\u25b6 ")  # ✅  🔒  ▶
+
+    raw_value = st.session_state.get("_section_radio")
+    if isinstance(raw_value, int):
+        new_idx = raw_value
+    elif isinstance(raw_value, str):
+        # Strip leading emoji prefix added by format_func, then match section title.
+        title = raw_value
+        for _pfx in _LABEL_PREFIXES:
+            if raw_value.startswith(_pfx):
+                title = raw_value[len(_pfx):]
+                break
+        _title_map = {SECTIONS[i][1]: i for i in range(len(SECTIONS))}
+        mapped = _title_map.get(title)
+        if mapped is not None:
+            new_idx = mapped
+        else:
+            # Unrecognised label — treat as no movement
+            new_idx = int(st.session_state.get("_last_sidebar_idx", 0))
+            _dbg_log(
+                "section_radio_on_change_unrecognised",
+                raw_value=raw_value,
+                stripped_title=title,
+                fallback_idx=new_idx,
+            )
+    else:
+        new_idx = int(st.session_state.get("_last_sidebar_idx", 0))
+
+    last_idx = int(st.session_state.get("_last_sidebar_idx", new_idx))
+    moved = (new_idx != last_idx)
+    st.session_state["_section_radio_user_changed"] = bool(moved)
+    # PLAYER_DEBUG: record on_change outcome
+    _dbg_log(
+        "section_radio_on_change",
+        raw_value=raw_value,
+        new_idx=new_idx,
+        last_idx=last_idx,
+        moved=moved,
+        flag_set=bool(moved),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper — fetch lead status
+# ---------------------------------------------------------------------------
+def _fetch_status(lid: str) -> dict | None:
+    """Call get_lead_status and return the result, or None on error."""
+    try:
+        return get_lead_status(lid, db_path=DB_PATH)
+    except sqlite3.OperationalError:
+        st.error("Could not save progress. Check that tmp/app.db is accessible.")
+    except Exception:
+        logging.exception("Unexpected error fetching lead status")
+        st.error("An unexpected error occurred. See console for details.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Sidebar — Lead ID + Sections + Progress
+# ---------------------------------------------------------------------------
+_trace_backnav("TOP_OF_RUN")
+with st.sidebar:
+    # PLAYER_DEBUG: sidebar expander
+    if _dbg_enabled():
+        with st.expander("Debug: Player state", expanded=False):
+            st.json(_dbg_snap(st.session_state))
+
+    st.title("Course Player")
+
+    # Token-resolved users already have player_lead_id set by student_app.py.
+    # Skip the manual prompt and use the pre-resolved identity directly.
+    if st.session_state["player_lead_id"]:
+        lead_id = st.session_state["player_lead_id"]
+    else:
+        lead_id = st.text_input(
+            "Access code",
+            value="",
+            placeholder="Enter your access code",
+        ).strip()
+        # Require an existing course invite for manual-entry users.
+        # Token-resolved users never reach this branch — they are handled above.
+        if lead_id and not _lead_has_invite(lead_id):
+            st.error(
+                "This Lead ID has no course invite on record. "
+                "Please use the link sent to you by your instructor."
+            )
+            lead_id = ""  # block all downstream rendering
+
+    # Reset per-session tracking whenever the lead changes.
+    if lead_id != st.session_state["player_lead_id"]:
+        st.session_state["player_completed"] = set()
+        st.session_state["player_status"] = None
+        st.session_state["player_lead_id"] = lead_id
+        st.session_state["player_course_started"] = False
+
+    # Sections + progress only render once lead is entered AND course has started.
+    if lead_id and st.session_state.get("player_course_started"):
+        # Load status once per session (or after a lead change).
+        if st.session_state["player_status"] is None:
+            st.session_state["player_status"] = _fetch_status(lead_id)
+            _hydrate_completed_from_status(st.session_state.get("player_status"))
+
+        st.subheader("Sections")
+        completed: set[str] = st.session_state["player_completed"]
+        allowed_max_idx = int(_unlocked_frontier_idx(completed, st.session_state.get("player_status")))
+        # PLAYER_DEBUG: allowed_max_idx log
+        _dbg_log(
+            "frontier_computed",
+            allowed_max_idx=int(allowed_max_idx),
+            completed_count=len(completed),
+            state=_dbg_snap(st.session_state),
+        )
+
+        # Guard: skip all programmatic nav mutations while confirm UI is active.
+        in_confirm = st.session_state.get("_backnav_pending_idx") is not None
+        _dbg_log(
+            "confirm_mode_eval",
+            in_confirm=in_confirm,
+            backnav_pending=st.session_state.get("_backnav_pending_idx"),
+            section_radio=st.session_state.get("_section_radio"),
+            pending=st.session_state.get("_section_radio_pending"),
+            confirmed=st.session_state.get("_section_radio_confirmed"),
+        )
+
+        # Apply deferred section navigation BEFORE the radio is instantiated.
+        # (Setting _section_radio after the widget exists raises a Streamlit error.)
+        _pending_applied_this_run = False
+        if (
+            "_section_radio_pending" in st.session_state
+            and st.session_state.get("_backnav_pending_idx") is None
+            and not st.session_state.get("_section_radio_user_changed", False)
+        ):
+            _pend = max(0, min(len(SECTIONS) - 1, int(st.session_state["_section_radio_pending"])))
+            _applied = min(_pend, int(allowed_max_idx))
+            st.session_state["_section_radio"] = _applied
+            _pending_applied_this_run = True
+            del st.session_state["_section_radio_pending"]
+            # IMPORTANT: this change was internal, not a user click.
+            _trace_backnav("CLEAR_SITE_PENDING_APPLIER_BEFORE")
+            _dbg_log(
+                "backnav_pending_set",
+                reason="apply_pending", new_value=None, active_idx=None,
+                confirmed_idx=st.session_state.get("_section_radio_confirmed"),
+                section_radio=st.session_state.get("_section_radio"),
+                section_radio_pending=st.session_state.get("_section_radio_pending"),
+                section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                suppress_once=st.session_state.get("_suppress_backnav_once"),
+                last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+            )
+            st.session_state["_backnav_pending_idx"] = None
+            _trace_backnav("CLEAR_SITE_PENDING_APPLIER_AFTER")
+            st.session_state["_suppress_backnav_once"] = True
+            st.session_state["_last_sidebar_idx"] = int(_applied)
+            # PLAYER_DEBUG: pending-apply log
+            _dbg_log(
+                "pending_applied",
+                run_id=_RUN_ID,
+                time=time.monotonic(),
+                applied_idx=_applied,
+                _section_radio=st.session_state.get("_section_radio"),
+                _section_radio_confirmed=st.session_state.get("_section_radio_confirmed"),
+                _section_radio_pending=st.session_state.get("_section_radio_pending"),
+                _section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                _suppress_backnav_once=st.session_state.get("_suppress_backnav_once"),
+                _last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+                player_flow_step=st.session_state.get("player_flow_step"),
+                player_completed=sorted(list(st.session_state.get("player_completed", []))),
+                _backnav_pending_idx=st.session_state.get("_backnav_pending_idx"),
+            )
+
+        _radio_options = range(len(SECTIONS))
+        _cur_radio_idx = st.session_state.get("_section_radio", 0)
+
+        def _section_label(i: int) -> str:
+            sid, title = SECTIONS[i][0], SECTIONS[i][1]
+            is_done   = sid in completed
+            is_locked = i > allowed_max_idx
+            is_cur    = i == _cur_radio_idx
+            if is_done:
+                return f"\u2713 {title}  \n*Completed*"
+            if is_locked:
+                return f"{title}  \n*Locked*"
+            if is_cur:
+                return f"{title}  \n*In progress*"
+            return f"{title}  \n*Not started*"
+
+        _radio_raw = st.radio(
+            "Select a section",
+            options=_radio_options,
+            format_func=_section_label,
+            key="_section_radio",
+            label_visibility="collapsed",
+            on_change=_on_section_radio_change,
+        )
+        active_idx: int = _radio_raw
+        # PLAYER_DEBUG: forensic log — only when state has signal worth capturing.
+        if (
+            st.session_state.get("_section_radio") != st.session_state.get("_section_radio_confirmed")
+            or st.session_state.get("_section_radio_pending") is not None
+            or st.session_state.get("_backnav_pending_idx") is not None
+            or st.session_state.get("player_flow_step") == "complete"
+        ):
+            _dbg_log(
+                "radio_forensics",
+                run_id=_RUN_ID,
+                time=time.monotonic(),
+                _section_radio=st.session_state.get("_section_radio"),
+                _section_radio_confirmed=st.session_state.get("_section_radio_confirmed"),
+                _section_radio_pending=st.session_state.get("_section_radio_pending"),
+                _section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                _suppress_backnav_once=st.session_state.get("_suppress_backnav_once"),
+                _last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+                player_flow_step=st.session_state.get("player_flow_step"),
+                player_completed=sorted(list(st.session_state.get("player_completed", []))),
+                _backnav_pending_idx=st.session_state.get("_backnav_pending_idx"),
+                radio_raw=_radio_raw,
+                radio_raw_type=str(type(_radio_raw)),
+                derived_active_idx=active_idx,
+                raw_in_options=(_radio_raw in _radio_options),
+            )
+        # Drift clamp — must sit AFTER radio_forensics (to log the raw drift) and BEFORE
+        # active_section_id assignment (so all downstream logic uses the corrected idx).
+        # If the user did NOT click the sidebar and the radio drifted away from confirmed
+        # (e.g. Streamlit resets the widget to 0 on rerun), silently restore confirmed.
+        _confirmed_for_clamp = int(st.session_state.get("_section_radio_confirmed", active_idx))
+        _user_changed_for_clamp = bool(st.session_state.get("_section_radio_user_changed", False))
+        if (not in_confirm) and (not _user_changed_for_clamp) and (active_idx != _confirmed_for_clamp):
+            _dbg_log(
+                "sidebar_drift_clamped",
+                from_idx=active_idx,
+                to_idx=_confirmed_for_clamp,
+                radio_raw=st.session_state.get("_section_radio"),
+            )
+            if st.session_state.get("player_flow_step") == "complete":
+                # Soft clamp: fix active_idx locally so downstream sees the right section,
+                # but do NOT set pending state or rerun (that would swallow the form submit).
+                _dbg_log(
+                    "sidebar_drift_soft_clamped_complete",
+                    run_id=_RUN_ID,
+                    from_idx=active_idx,
+                    to_idx=_confirmed_for_clamp,
+                )
+                active_idx = _confirmed_for_clamp
+            else:
+                # Use pending-nav mechanism — never write _section_radio post-widget.
+                # Do NOT clear _backnav_pending_idx here: a legitimate intercept may already be set.
+                st.session_state["_section_radio_pending"] = _confirmed_for_clamp
+                st.session_state["_suppress_backnav_once"] = True
+                st.rerun()
+        elif _user_changed_for_clamp and (active_idx != _confirmed_for_clamp):
+            _dbg_log(
+                "sidebar_drift_clamp_skipped",
+                reason="user_changed",
+                active_idx=active_idx,
+                confirmed=st.session_state.get("_section_radio_confirmed"),
+                backnav_pending=st.session_state.get("_backnav_pending_idx"),
+            )
+
+        active_section_id, active_title = SECTIONS[active_idx]
+        _trace_backnav("AFTER_SIDEBAR_RADIO")
+
+        # Snapshot and consume one-shot suppression flag before any intercept logic.
+        # Capturing it here ensures the intercept condition sees the correct value
+        # even if the flag would otherwise be cleared inside the if/else below.
+        _suppress_once = bool(st.session_state.get("_suppress_backnav_once"))
+        if _suppress_once:
+            st.session_state["_suppress_backnav_once"] = False
+
+        # Back-nav confirmation intercept:
+        # Only trigger on a REAL user click to a previously completed earlier section.
+        # Never trigger during internal reruns (pending nav) or one-shot suppression.
+        _has_pending_nav = "_section_radio_pending" in st.session_state
+        if _has_pending_nav:
+            # If an internal navigation is in-flight, kill any stale back-nav intent.
+            # Skip if a back-nav confirmation is already pending — preserve confirm state.
+            if st.session_state.get("_backnav_pending_idx") is None:
+                _trace_backnav("CLEAR_SITE_HAS_PENDING_NAV_BEFORE")
+                _dbg_log(
+                    "backnav_pending_set",
+                    reason="has_pending_nav", new_value=None, active_idx=active_idx,
+                    confirmed_idx=st.session_state.get("_section_radio_confirmed"),
+                    section_radio=st.session_state.get("_section_radio"),
+                    section_radio_pending=st.session_state.get("_section_radio_pending"),
+                    section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                    suppress_once=st.session_state.get("_suppress_backnav_once"),
+                    last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+                )
+                st.session_state["_backnav_pending_idx"] = None
+                _trace_backnav("CLEAR_SITE_HAS_PENDING_NAV_AFTER")
+
+        # One-shot suppression for internal reruns (e.g., Mark Complete / Go to next section).
+        if st.session_state.get("_suppress_backnav_once"):
+            st.session_state["_suppress_backnav_once"] = False
+        else:
+            _last_idx_raw = st.session_state.get("_last_sidebar_idx", active_idx)
+            if _last_idx_raw is None:
+                _last_idx_raw = active_idx
+            _last_idx = int(_last_idx_raw)
+            _confirmed_idx = int(st.session_state.get("_section_radio_confirmed", 0))
+            _sidebar_moved = (active_idx != _last_idx)
+            _user_changed_sidebar = _sidebar_moved and (not _has_pending_nav)
+            _target_completed = active_section_id in st.session_state.get("player_completed", set())
+
+            # PLAYER_DEBUG: sidebar movement gate evaluation
+            _dbg_log(
+                "sidebar_moved_eval",
+                active_idx=active_idx,
+                last_idx=_last_idx,
+                sidebar_moved=_sidebar_moved,
+                confirmed_idx=_confirmed_idx,
+                section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+            )
+            # PLAYER_DEBUG: log flag value during backnav intercept evaluation
+            _dbg_log(
+                "backnav_intercept_eval",
+                section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                active_idx=active_idx,
+                confirmed_idx=_confirmed_idx,
+                target_completed=_target_completed,
+                has_pending_nav=_has_pending_nav,
+                pending_applied_this_run=_pending_applied_this_run,
+                suppress_once=_suppress_once,
+            )
+            if (not _pending_applied_this_run) and (not _has_pending_nav) and _target_completed and (active_idx < _confirmed_idx) and _sidebar_moved and (not _suppress_once) and st.session_state.get("_section_radio_user_changed"):
+                _trace_backnav("INTERCEPT_BEFORE_SET")
+                _dbg_log(
+                    "backnav_pending_set",
+                    reason="intercept", new_value=int(active_idx), active_idx=active_idx,
+                    confirmed_idx=st.session_state.get("_section_radio_confirmed"),
+                    section_radio=st.session_state.get("_section_radio"),
+                    section_radio_pending=st.session_state.get("_section_radio_pending"),
+                    section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                    suppress_once=st.session_state.get("_suppress_backnav_once"),
+                    last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+                )
+                st.session_state["_backnav_pending_idx"] = int(active_idx)
+                st.session_state["_section_radio_pending"] = _confirmed_idx
+                _trace_backnav("INTERCEPT_AFTER_SET")
+                # Reset flag here so it is False on the very next rerun — not left
+                # lingering across the confirm-UI rerun (st.rerun() below stops
+                # execution before the unconditional reset at the end of sidebar).
+                st.session_state["_section_radio_user_changed"] = False
+                _trace_backnav("INTERCEPT_BEFORE_RERUN")
+                st.rerun()
+
+        # Reset user-changed flag — one-shot, consumed for this run.
+        st.session_state["_section_radio_user_changed"] = False
+
+        # Update last rendered sidebar idx at the end of sidebar logic (not a user action).
+        st.session_state["_last_sidebar_idx"] = int(active_idx)
+
+        # Enforce lock: redirect back to the furthest allowed section.
+        if (not in_confirm) and active_idx > allowed_max_idx:
+            st.session_state["_section_radio_pending"] = allowed_max_idx
+            st.session_state["_suppress_backnav_once"] = True
+            st.session_state["player_flash"] = (
+                "info",
+                "Complete the current section to unlock the next one.",
+            )
+            st.rerun()
+
+        # Reset tutor history (per-lead) when the student navigates to a new section.
+        if active_section_id != st.session_state["tutor_section_id"]:
+            _tutor_lid = lead_id or "unknown"
+            st.session_state["tutor_history"][_tutor_lid] = []
+            st.session_state["tutor_lead_id"] = _tutor_lid
+            st.session_state["tutor_section_id"] = active_section_id
+
+        # Reset guided flow when the student navigates to a new section.
+        if active_section_id != st.session_state["player_flow_section_id"]:
+            st.session_state["player_flow_step"] = "welcome"
+            st.session_state["player_flow_chunk_idx"] = 0
+            st.session_state["player_flow_section_id"] = active_section_id
+            st.session_state["player_quiz_idx"] = 0
+            st.session_state["player_quiz_q_idx"] = 0
+            st.session_state["player_quiz_attempts"] = {}
+            st.session_state["player_quiz_correct"] = set()
+            st.session_state["player_refl_idx"] = 0
+
+        st.divider()
+        st.subheader("Progress")
+
+        status = st.session_state["player_status"]
+        if status is None or not status.get("lead_exists"):
+            pct = 0.0
+            current = EM_DASH
+            last_activity = EM_DASH
+        else:
+            cs = status["course_state"]
+            pct = cs["completion_pct"] if cs["completion_pct"] is not None else 0.0
+            _raw_current = cs["current_section"]
+            _sid_to_title = {sid: title for sid, title in SECTIONS}
+            current = _sid_to_title.get(_raw_current, _raw_current) if _raw_current else EM_DASH
+            _raw_last = cs["last_activity_at"]
+            if _raw_last:
+                try:
+                    last_activity = datetime.fromisoformat(_raw_last).strftime("%b %d, %Y %H:%M UTC")
+                except (ValueError, TypeError):
+                    last_activity = _raw_last
+            else:
+                last_activity = EM_DASH
+
+        st.metric("Completion", f"{pct:.2f} %")
+        st.progress(pct / 100.0, text="")
+        st.write(f"**Current:** {current}")
+        st.write(f"**Last activity:** {last_activity}")
+
+# ---------------------------------------------------------------------------
+# Main content area — guided flow (full width, no column wrapper)
+# ---------------------------------------------------------------------------
+
+# Flash message — stored before st.rerun() so it survives the cycle.
+if st.session_state["player_flash"] is not None:
+    level, msg = st.session_state["player_flash"]
+    st.session_state["player_flash"] = None
+    if level == "success":
+        st.success(msg)
+    else:
+        st.error(msg)
+
+# Deferred toast — queued before st.rerun() and rendered at the start of
+# the next run, after the page has re-rendered, so it stays visible.
+if st.session_state["player_toast"] is not None:
+    _toast_msg, _toast_icon = st.session_state["player_toast"]
+    st.session_state["player_toast"] = None
+    try:
+        st.toast(_toast_msg, icon=_toast_icon)
+    except Exception:
+        pass
+
+
+# ── Back-nav reset confirmation UI ────────────────────────────────────────────
+# Shown when student selects a previously completed section.
+# The sidebar intercept stashes the target index here and bounces the radio back.
+if st.session_state.get("_backnav_pending_idx") is not None:
+    _target_idx = int(st.session_state["_backnav_pending_idx"])
+    _target_sid, _target_title = SECTIONS[_target_idx]
+
+    _trace_backnav("CONFIRM_BLOCK_ENTER")
+    # PLAYER_DEBUG: confirm-screen render log
+    _dbg_log(
+        "backnav_confirm_rendered",
+        backnav_pending_idx=int(st.session_state["_backnav_pending_idx"]),
+        section_radio=st.session_state.get("_section_radio"),
+        section_radio_confirmed=st.session_state.get("_section_radio_confirmed"),
+        state=_dbg_snap(st.session_state),
+    )
+
+    with st.container(border=True):
+        st.warning(
+            f"### Jump back to **{_target_title}**?\n"
+            "You've already completed this section. If you continue:\n\n"
+            "\u2022 Sections after this one will be **reset and relocked**\n"
+            "\u2022 Later quiz/reflection progress will be **cleared**\n"
+            "\u2022 Your saved progress will roll back to this point\n\n"
+            "**This action can't be undone.**"
+        )
+        _c1, _c2 = st.columns(2)
+        with _c1:
+            if st.button("Continue and reset progress", type="primary", key="btn_backnav_confirm"):
+                _keep = {
+                    sid for i, (sid, _t) in enumerate(SECTIONS)
+                    if i < _target_idx
+                    and sid in st.session_state.get("player_completed", set())
+                }
+                st.session_state["player_completed"] = set(_keep)
+                # Clear per-section animation + quiz-choice keys for reset sections.
+                _sids_reset = {sid for sid, _t in SECTIONS[_target_idx:]}
+                st.session_state["quiz_submitted"] = {
+                    k for k in st.session_state.get("quiz_submitted", set())
+                    if k.split(":")[0] not in _sids_reset
+                }
+                for _sk in [k for k in list(st.session_state.keys())
+                             if any(k.startswith(f"chunk_typed_{s}") or
+                                    k.startswith(f"welcome_typed_{s}") or
+                                    k.startswith(f"reflection_txt_{s}")
+                                    for s in _sids_reset)]:
+                    del st.session_state[_sk]
+                _reset_db_progress_from_idx(
+                    lead_id,
+                    from_idx=int(st.session_state.get("_section_radio_confirmed", _target_idx)),
+                    to_idx=_target_idx,
+                )
+                try:
+                    st.session_state["player_status"] = get_lead_status(lead_id, db_path=DB_PATH)
+                    # Do NOT call _hydrate_completed_from_status here.
+                    # player_completed was deliberately trimmed to set(_keep) above;
+                    # hydrating from completion_pct would re-add sections that should
+                    # now be locked, causing "Not started" instead of "Locked" in sidebar.
+                except Exception:
+                    pass
+                st.session_state["_section_radio_confirmed"] = _target_idx
+                st.session_state["_section_radio_pending"] = _target_idx
+                st.session_state["player_flow_step"] = "welcome"
+                st.session_state["player_flow_chunk_idx"] = 0
+                st.session_state["player_quiz_idx"] = 0
+                st.session_state["player_quiz_q_idx"] = 0
+                st.session_state["player_quiz_attempts"] = {}
+                st.session_state["player_quiz_correct"] = set()
+                st.session_state["player_refl_idx"] = 0
+                _trace_backnav("CLEAR_SITE_CONFIRM_BTN_BEFORE")
+                _dbg_log(
+                    "backnav_pending_set",
+                    reason="confirm_btn", new_value=None, active_idx=active_idx,
+                    confirmed_idx=st.session_state.get("_section_radio_confirmed"),
+                    section_radio=st.session_state.get("_section_radio"),
+                    section_radio_pending=st.session_state.get("_section_radio_pending"),
+                    section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                    suppress_once=st.session_state.get("_suppress_backnav_once"),
+                    last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+                )
+                st.session_state["_backnav_pending_idx"] = None
+                _trace_backnav("CLEAR_SITE_CONFIRM_BTN_AFTER")
+                st.rerun()
+        with _c2:
+            if st.button("Cancel", key="btn_backnav_cancel"):
+                _trace_backnav("CLEAR_SITE_CANCEL_BTN_BEFORE")
+                _dbg_log(
+                    "backnav_pending_set",
+                    reason="cancel_btn", new_value=None, active_idx=active_idx,
+                    confirmed_idx=st.session_state.get("_section_radio_confirmed"),
+                    section_radio=st.session_state.get("_section_radio"),
+                    section_radio_pending=st.session_state.get("_section_radio_pending"),
+                    section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                    suppress_once=st.session_state.get("_suppress_backnav_once"),
+                    last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+                )
+                st.session_state["_backnav_pending_idx"] = None
+                _trace_backnav("CLEAR_SITE_CANCEL_BTN_AFTER")
+                st.rerun()
+
+    _trace_backnav("BEFORE_STOP_CONFIRM_BLOCK")
+    st.stop()
+
+
+# ── White logo header — visible on every player screen ────────────────────────
+_logo_path = REPO_ROOT / "ui" / "assets" / "colaberry_logo(wide).png"
+if _logo_path.exists():
+    st.image(str(_logo_path), width=260)
+else:
+    st.markdown("### Colaberry")
+st.markdown(
+    "<div style='height:1px; background:rgba(0,0,0,0.08); margin:0.45rem 0 0.75rem;'></div>",
+    unsafe_allow_html=True,
+)
+
+# ── Course-level welcome screen ────────────────────────────────────────────────
+# Portal gate: always shown until the student clicks a begin/resume CTA.
+if not st.session_state.get("player_course_started"):
+    # Proactively fetch status (once per session) so we can choose the right CTA
+    # before any button is clicked.  Reuses the same player_status key used
+    # everywhere else — no new DB path, no extra queries on repeated reruns.
+    if lead_id and st.session_state.get("player_status") is None:
+        try:
+            st.session_state["player_status"] = _fetch_status(lead_id)
+            _hydrate_completed_from_status(st.session_state.get("player_status"))
+        except Exception:
+            pass
+
+    _wc_status = st.session_state.get("player_status") if lead_id else None
+    _wc_has_progress = bool(
+        _wc_status
+        and _wc_status.get("lead_exists")
+        and float((_wc_status.get("course_state") or {}).get("completion_pct") or 0) > 0
+    )
+
+    # Shared helper: compute resume section index from status.
+    def _wc_compute_resume_idx(status: dict | None) -> int:
+        idx = _unlocked_frontier_idx(st.session_state.get("player_completed", set()), status)
+        try:
+            cs = (status or {}).get("course_state") or {}
+            cur = cs.get("current_section")
+            if cur:
+                _imap = {sid: i for i, (sid, _t) in enumerate(SECTIONS)}
+                idx = max(idx, _imap.get(cur, 0))
+        except Exception:
+            pass
+        return max(0, min(len(SECTIONS) - 1, int(idx)))
+
+    # Shared helper: apply all flow-start state and rerun.
+    def _wc_start(resume_idx: int) -> None:
+        st.session_state["player_course_started"] = True
+        st.session_state["player_flow_step"] = "welcome"
+        st.session_state["player_flow_chunk_idx"] = 0
+        st.session_state["player_quiz_idx"] = 0
+        st.session_state["player_quiz_q_idx"] = 0
+        st.session_state["player_quiz_attempts"] = {}
+        st.session_state["player_quiz_correct"] = set()
+        st.session_state["player_refl_idx"] = 0
+        st.session_state["_section_radio"] = resume_idx
+        st.session_state["_section_radio_confirmed"] = int(resume_idx)
+        st.rerun()
+
+    _cw_lines = [
+        "This course guides you through the fundamentals of AI in 9 short sections.",
+        "Each section follows the same pattern: read a guided lesson, test your "
+        "understanding with a quiz, then capture a brief reflection.",
+        "Work at your own pace — your progress is saved automatically after each section.",
+    ]
+    _cw_key = "course_welcome_typed"
+    with st.container(border=True):
+        st.markdown("## Welcome to **Intro to AI**")
+
+        # Typewriter intro (runs once per session, then renders static).
+        _cw_ph = st.empty()
+        if _cw_key not in st.session_state:
+            st.session_state[_cw_key] = False
+        if st.session_state.get(_cw_key) is False:
+            _cw_text = ""
+            for _cw_line in _cw_lines:
+                for _cw_char in _cw_line:
+                    _cw_text += _cw_char
+                    _cw_ph.markdown(_cw_text)
+                    time.sleep(0.01)
+                _cw_text += "\n\n"
+            st.session_state[_cw_key] = True
+        else:
+            _cw_ph.markdown("\n\n".join(_cw_lines))
+
+        # ── Course outline preview card ────────────────────────────────────────
+        st.markdown(
+            "<div style='height: 1px; background: rgba(0,0,0,0.08); margin: 1rem 0;'></div>",
+            unsafe_allow_html=True,
+        )
+        _sid_to_title_wc = {sid: title for sid, title in SECTIONS}
+        st.markdown(
+            f"**{len(SECTIONS)} sections** &nbsp;·&nbsp; "
+            "Each section: **Lesson → Quiz → Reflection**",
+            unsafe_allow_html=True,
+        )
+        with st.expander("View course outline"):
+            for _wc_i, (_wc_sid, _wc_stitle) in enumerate(SECTIONS):
+                st.markdown(f"{_wc_i + 1}. {_wc_stitle}")
+
+        st.markdown("<div style='height: 18px'></div>", unsafe_allow_html=True)
+
+        # ── CTA: Resume / Restart vs Begin ────────────────────────────────────
+        if not lead_id:
+            # No lead entered yet — show a disabled Begin button with guidance.
+            st.button("Begin Course →", type="primary", key="btn_begin_course", disabled=True)
+            st.caption("Use your invite link or enter the access code your instructor sent you to begin.")
+
+        elif _wc_has_progress:
+            # Progress exists — show Resume (primary) + Restart (secondary).
+            _wc_cs = _wc_status["course_state"]                             # type: ignore[index]
+            _wc_pct = float(_wc_cs.get("completion_pct") or 0)
+            _wc_cur_sid = _wc_cs.get("current_section") or ""
+            _wc_cur_title = _sid_to_title_wc.get(_wc_cur_sid, "") if _wc_cur_sid else ""
+            _wc_summary = f"{_wc_pct:.0f}% complete"
+            if _wc_cur_title:
+                _wc_summary += f" · last section: **{_wc_cur_title}**"
+            st.markdown(
+                f'<p class="cb-progress-meta">Progress saved — {_wc_summary}</p>',
+                unsafe_allow_html=True,
+            )
+
+            _rb_col, _rs_col = st.columns([2, 1])
+            with _rb_col:
+                if st.button(
+                    "Resume →", type="primary",
+                    key="btn_resume_course", use_container_width=True,
+                ):
+                    _wc_start(_wc_compute_resume_idx(_wc_status))
+            with _rs_col:
+                if st.button(
+                    "Restart course",
+                    key="btn_restart_course", use_container_width=True,
+                ):
+                    # Clear DB progress so the next login also starts from scratch.
+                    _wc_frontier = _unlocked_frontier_idx(
+                        st.session_state.get("player_completed", set()), _wc_status
+                    )
+                    _reset_db_progress_from_idx(
+                        lead_id,
+                        from_idx=int(_wc_frontier),
+                        to_idx=0,
+                    )
+                    # Reset in-session state.
+                    st.session_state["player_completed"] = set()
+                    st.session_state["player_status"] = None
+                    _tutor_lid_wc = lead_id or "unknown"
+                    st.session_state["tutor_history"][_tutor_lid_wc] = []
+                    st.session_state["_backnav_pending_idx"] = None
+                    st.session_state["_last_sidebar_idx"] = 0
+                    st.session_state["_suppress_backnav_once"] = True
+                    _wc_start(0)
+
+        else:
+            # No progress — standard Begin Course CTA.
+            if st.button("Begin Course →", type="primary", key="btn_begin_course"):
+                _hydrate_completed_from_status(_wc_status)
+                _wc_start(_wc_compute_resume_idx(_wc_status))
+
+    _trace_backnav("BEFORE_STOP_WELCOME")
+    st.stop()
+
+# Load section markdown (shared across all steps).
+content_path = COURSE_CONTENT_DIR / f"{active_section_id}.md"
+try:
+    section_markdown = content_path.read_text(encoding="utf-8")
+except Exception:
+    section_markdown = None
+
+# Load cached course data (file I/O once per session).
+try:
+    course_map = _cached_course_map()
+    quiz_library = _cached_quiz_library()
+except Exception:
+    logging.exception("Failed to load course map or quiz library")
+    course_map = {}
+    quiz_library = {}
+
+section_data = course_map.get(active_section_id, {})
+section_quiz_ids: list[str] = section_data.get("quiz_ids", [])
+section_prompt_ids: list[str]   = section_data.get("reflection_prompts", [])
+section_rating_prompts: list[str] = section_data.get("rating_prompts", [])
+
+# Chunk the lesson markdown (deterministic — no randomness).
+chunks = _chunk_markdown(section_markdown) if section_markdown else ["Content unavailable."]
+# Drop a leading H1 intro chunk — section files that begin with `# Section Title\n\n...`
+# produce a chunk 0 that duplicates the hero screen. Real lesson content uses H2+.
+if chunks and chunks[0].lstrip().startswith("# "):
+    chunks = chunks[1:] or ["Content unavailable."]
+n_chunks = len(chunks)
+
+# Clamp chunk_idx in case section content shrinks after a nav change.
+chunk_idx = min(st.session_state["player_flow_chunk_idx"], max(0, n_chunks - 1))
+step = st.session_state["player_flow_step"]
+
+# ── Sticky section header — weighted monotonic section progress ────────────────
+_WELCOME_W = 0.05
+_LESSON_W  = 0.55
+_QUIZ_W    = 0.25
+_REFL_W    = 0.10
+# _COMPLETE_BONUS = 0.05  (sum of weights = 1.0 at complete)
+
+_lesson_frac = (chunk_idx + 1) / max(1, n_chunks) if step != "welcome" else 0.0
+_n_quizzes   = len(section_quiz_ids)
+_quiz_frac   = (
+    1.0 if _n_quizzes == 0
+    else min(1.0, st.session_state["player_quiz_idx"] / _n_quizzes)
+)
+_n_prompts   = len(section_prompt_ids)
+_refl_frac   = (
+    1.0 if _n_prompts == 0
+    else min(1.0, st.session_state["player_refl_idx"] / _n_prompts)
+)
+
+if step == "welcome":
+    _bar_val = 0.0
+elif step == "lesson":
+    _bar_val = _WELCOME_W + _LESSON_W * _lesson_frac
+elif step == "quiz":
+    _bar_val = _WELCOME_W + _LESSON_W + _QUIZ_W * _quiz_frac
+elif step == "reflection":
+    _bar_val = _WELCOME_W + _LESSON_W + _QUIZ_W + _REFL_W * _refl_frac
+else:  # complete
+    _bar_val = 1.0
+_bar_val = max(0.0, min(1.0, _bar_val))
+
+_topbar_caption = f"Section {active_idx + 1} of {len(SECTIONS)}"
+if step == "lesson" and n_chunks > 1:
+    _topbar_caption += f" • Reading {chunk_idx + 1} of {n_chunks}"
+st.markdown(
+    f"""<div class="cb-topbar">
+      <p class="cb-topbar-caption">{_topbar_caption}</p>
+      <p class="cb-topbar-title">{active_title}</p>
+    </div>""",
+    unsafe_allow_html=True,
+)
+st.progress(_bar_val, text="")
+
+
+# ── Tutor expander — closure over active_title / section_markdown / step ───────
+def _render_tutor_expander() -> None:
+    # Per-lead message list: switching lead preserves each lead's history.
+    _active_lid = lead_id or "unknown"
+    messages = st.session_state["tutor_history"].setdefault(_active_lid, [])
+
+    def _call_tutor(user_msg: str) -> None:
+        """Append user message, generate tutor reply, append assistant message."""
+        messages.append({"role": "user", "content": user_msg})
+        with st.spinner("Thinking…"):
+            reply = generate_tutor_reply(
+                section_title=active_title,
+                section_markdown=section_markdown or "",
+                user_message=user_msg,
+                history=messages[:-1],
+                section_idx=active_idx,
+                total_sections=len(SECTIONS),
+                chunk_idx=chunk_idx,
+                total_chunks=n_chunks,
+                flow_step=step,
+            )
+        messages.append({"role": "assistant", "content": reply})
+
+    _tutor_hints: dict[str, str] = {
+        "lesson":     "💡 Need help understanding something? The tutor can explain it simply.",
+        "quiz":       "💡 Stuck on a question? The tutor can guide your thinking.",
+        "reflection": "💡 Want to go deeper? The tutor can help you connect ideas.",
+        "complete":   "💡 Want a quick review? The tutor can reinforce what you learned.",
+    }
+    st.caption(_tutor_hints.get(step, "💡 Have a question? The tutor is here to help."))
+
+    with st.expander("AI Tutor — Ask for help anytime", expanded=False):
+        # Welcome line — only shown when no messages exist yet.
+        if len(messages) == 0:
+            _tutor_welcome: dict[str, str] = {
+                "lesson":     f"You're working through **{active_title}**. Ask me anything, or use the options below.",
+                "quiz":       f"You're on the quiz for **{active_title}**. Want help thinking through a question?",
+                "reflection": f"You're reflecting on **{active_title}**. I can help you go deeper or connect ideas.",
+                "complete":   f"You finished **{active_title}**. Want to review anything before moving on?",
+            }
+            st.caption(_tutor_welcome.get(step, f"Ask me anything about **{active_title}**."))
+
+        # Quick-action buttons — 2 × 2 grid, labels vary by flow_step.
+        # Each button directly calls the tutor in-place; the implicit Streamlit
+        # rerun from the button click re-renders the updated chat history.
+        # No tutor_pending / extra st.rerun() needed here.
+        _step_buttons: dict[str, list[str]] = {
+            "lesson":     ["Summarize this simply", "Give me a real example",
+                           "Explain like I'm new", "What matters most here?"],
+            "quiz":       ["Help me think this through", "Give me a hint",
+                           "Explain this concept", "What should I focus on?"],
+            "reflection": ["Help me go deeper", "Challenge my thinking",
+                           "Connect this to real life", "What did I really learn?"],
+            "complete":   ["Summarize this section", "What should I remember?",
+                           "How does this connect forward?", "Test me quickly"],
+        }
+        _step_button_prompts: dict[str, str] = {
+            # lesson
+            "Summarize this simply":      "Can you explain this section in simple terms and give me a real-world example?",
+            "Give me a real example":     "Can you give me a clear real-world example of what this section is teaching?",
+            "Explain like I'm new":       "I'm completely new to this — can you explain this step by step in a very simple way?",
+            "What matters most here?":    "What are the most important takeaways from this section and what should I focus on remembering?",
+            # quiz
+            "Help me think this through": "I'm stuck on this — can you guide me step by step without giving me the answer?",
+            "Give me a hint":             "Can you give me a small hint to help me move in the right direction?",
+            "Explain this concept":       "Can you explain the concept behind this question in a simple way?",
+            "What should I focus on?":    "What should I focus on to get this question right?",
+            # reflection
+            "Help me go deeper":          "Can you help me go deeper on what I just learned and connect it to real-world applications?",
+            "Challenge my thinking":      "Can you challenge my understanding with a deeper question or perspective?",
+            "Connect this to real life":  "How does this concept show up in real life or real work situations?",
+            "What did I really learn?":   "What did I actually learn here beyond the surface level?",
+            # complete
+            "Summarize this section":     "Can you give me a clear and concise summary of this entire section?",
+            "What should I remember?":    "What are the key things I should remember long-term from this section?",
+            "How does this connect forward?": "How does this section connect to what comes next in the course?",
+            "Test me quickly":            "Can you quickly test my understanding with a couple of questions?",
+        }
+        _fallback_buttons = ["Summarize this simply", "Give me a real example",
+                             "Explain like I'm new", "What matters most here?"]
+        _btn_labels = _step_buttons.get(step, _fallback_buttons)
+
+        b_left, b_right = st.columns(2)
+        with b_left:
+            if st.button(_btn_labels[0], use_container_width=True, key=f"btn_0_{step}_{active_section_id}"):
+                st.session_state["tutor_input"] = _step_button_prompts.get(_btn_labels[0], _btn_labels[0])
+            if st.button(_btn_labels[1], use_container_width=True, key=f"btn_1_{step}_{active_section_id}"):
+                st.session_state["tutor_input"] = _step_button_prompts.get(_btn_labels[1], _btn_labels[1])
+        with b_right:
+            if st.button(_btn_labels[2], use_container_width=True, key=f"btn_2_{step}_{active_section_id}"):
+                st.session_state["tutor_input"] = _step_button_prompts.get(_btn_labels[2], _btn_labels[2])
+            if st.button(_btn_labels[3], use_container_width=True, key=f"btn_3_{step}_{active_section_id}"):
+                st.session_state["tutor_input"] = _step_button_prompts.get(_btn_labels[3], _btn_labels[3])
+
+        st.divider()
+
+        # Chat history — rendered top-to-bottom.
+        for msg in messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        # Free-form chat input — st.chat_input triggers its own rerun on submit;
+        # the explicit st.rerun() below ensures a clean second pass that clears
+        # the widget state and renders the updated history at the top.
+        user_input = st.chat_input(
+            "Ask about this section…",
+            key="tutor_input",
+        )
+        if user_input:
+            _call_tutor(user_input)
+            st.rerun()
+
+
+# ── WELCOME ───────────────────────────────────────────────────────────────────
+if step == "welcome":
+    # Presentation data only — emoji icon + mission subtitle per section_id.
+    _SECTION_INTROS: dict[str, tuple[str, str]] = {
+        "P1_S1": ("🤖", "Uncover what artificial intelligence actually is — and why it's reshaping everything around you."),
+        "P1_S2": ("🧠", "Discover how computers find patterns in data and improve without being explicitly programmed."),
+        "P1_S3": ("🌍", "See how AI powers the products, decisions, and experiences you encounter every day."),
+        "P2_S1": ("📊", "Learn why data is the fuel behind every AI system — and how to think about it clearly."),
+        "P2_S2": ("🔍", "Start asking real questions of data and build the intuition to see what numbers reveal."),
+        "P2_S3": ("🛠️", "Master the step that separates good AI models from great ones: clean, well-shaped data."),
+        "P3_S1": ("⚡", "Put everything into action and train your first machine learning model from scratch."),
+        "P3_S2": ("📈", "Learn to measure what your model actually learned — and where it still falls short."),
+        "P3_S3": ("🚀", "Tie it all together and chart your personal path deeper into the world of AI."),
+    }
+    _icon, _subtitle = _SECTION_INTROS.get(
+        active_section_id, ("📘", "Explore the key ideas in this section at your own pace.")
+    )
+    st.markdown(
+        f"""<div class="cb-section-hero">
+  <p class="cb-section-hero-eyebrow">Section {active_idx + 1} of {len(SECTIONS)}</p>
+  <div class="cb-section-hero-icon">{_icon}</div>
+  <h2 class="cb-section-hero-title">{active_title}</h2>
+  <p class="cb-section-hero-subtitle">{_subtitle}</p>
+  <div class="cb-section-hero-pills">
+    <span class="cb-section-hero-pill">Read</span>
+    <span class="cb-section-hero-arrow">→</span>
+    <span class="cb-section-hero-pill">Quiz</span>
+    <span class="cb-section-hero-arrow">→</span>
+    <span class="cb-section-hero-pill">Reflect</span>
+  </div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div style='height: 18px'></div>", unsafe_allow_html=True)
+    if st.button("Begin Section →", type="primary", use_container_width=True):
+        st.session_state["player_flow_step"] = "lesson"
+        st.session_state["player_flow_chunk_idx"] = 0
+        st.rerun()
+
+# ── LESSON ────────────────────────────────────────────────────────────────────
+elif step == "lesson":
+    with st.container(border=True):
+        st.markdown('<div class="cb-card-inner">', unsafe_allow_html=True)
+        st.markdown("<div style='height: 4px'></div>", unsafe_allow_html=True)
+        _chunk_key = f"chunk_typed_{active_section_id}_{chunk_idx}"
+        _chunk_ph = st.empty()
+        if _chunk_key not in st.session_state:
+            st.session_state[_chunk_key] = False
+        # Skip animation when entering chunk 0 of a newly-navigated section.
+        # Preserves the animation for all other chunks and for first-ever section entry.
+        if (
+            chunk_idx == 0
+            and st.session_state.get("last_section_id") != active_section_id
+        ):
+            st.session_state[_chunk_key] = True
+        st.session_state["last_section_id"] = active_section_id
+        if st.session_state.get(_chunk_key) is False:
+            _chunk_text = chunks[chunk_idx]
+            _built = ""
+            for _line in _chunk_text.splitlines():
+                _line_words = _line.split()
+                if not _line_words:
+                    _built += "\n"
+                    continue
+                _line_built = ""
+                for _wi in range(0, len(_line_words), 3):
+                    _line_built = " ".join(_line_words[: _wi + 3])
+                    _chunk_ph.write(_built + _line_built)
+                    time.sleep(0.01)
+                _built += _line_built + "\n"
+            _chunk_ph.markdown(_chunk_text)
+            st.session_state[_chunk_key] = True
+        else:
+            _chunk_ph.markdown(chunks[chunk_idx])
+        st.markdown("<div style='height: 12px'></div>", unsafe_allow_html=True)
+        st.divider()
+
+        is_last_chunk = chunk_idx >= n_chunks - 1
+        if is_last_chunk:
+            if section_quiz_ids:
+                fwd_label = "Continue to Quiz →"
+            elif section_prompt_ids:
+                fwd_label = "Continue to Reflection →"
+            else:
+                fwd_label = "Continue to Complete →"
+        else:
+            fwd_label = "Continue →"
+
+        st.markdown("<div style='height: 8px'></div>", unsafe_allow_html=True)
+        if st.button(fwd_label, type="primary", use_container_width=True):
+            if is_last_chunk:
+                if section_quiz_ids:
+                    st.session_state["player_flow_step"] = "quiz"
+                elif section_prompt_ids:
+                    st.session_state["player_flow_step"] = "reflection"
+                else:
+                    st.session_state["player_flow_step"] = "complete"
+                st.session_state["player_flow_chunk_idx"] = 0
+            else:
+                st.session_state["player_flow_chunk_idx"] = chunk_idx + 1
+            st.rerun()
+        if chunk_idx > 0:
+            if st.button("← Back", use_container_width=True):
+                st.session_state["player_flow_chunk_idx"] = chunk_idx - 1
+                st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    _render_tutor_expander()
+
+# ── QUIZ ──────────────────────────────────────────────────────────────────────
+elif step == "quiz":
+    with st.container(border=True):
+        st.markdown('<div class="cb-card-inner">', unsafe_allow_html=True)
+        if not section_quiz_ids:
+            st.info("No quiz for this section.")
+            if st.button(
+                "Continue to Reflection →" if section_prompt_ids else "Continue to Complete →",
+                type="primary",
+                use_container_width=True,
+            ):
+                st.session_state["player_flow_step"] = (
+                    "reflection" if section_prompt_ids else "complete"
+                )
+                st.rerun()
+        else:
+            quiz_idx = st.session_state["player_quiz_idx"]
+
+            if quiz_idx >= len(section_quiz_ids):
+                # All quizzes in this section finished — show continue.
+                st.success("Quiz complete! You're ready to reflect.")
+                next_label = (
+                    "Continue to Reflection →" if section_prompt_ids else "Continue to Complete →"
+                )
+                if st.button(next_label, type="primary", use_container_width=True):
+                    st.session_state["player_flow_step"] = (
+                        "reflection" if section_prompt_ids else "complete"
+                    )
+                    st.rerun()
+            else:
+                quiz_id = section_quiz_ids[quiz_idx]
+                quiz = quiz_library.get(quiz_id)
+
+                if quiz is None:
+                    st.warning(f"Quiz '{quiz_id}' not found in library.")
+                else:
+                    questions = quiz.get("questions", [])
+
+                    if not questions:
+                        st.info("This quiz has no questions.")
+                        if st.button("Next →", key=f"skip_quiz_{quiz_id}"):
+                            st.session_state["player_quiz_idx"] = quiz_idx + 1
+                            st.session_state["player_quiz_q_idx"] = 0
+                            st.rerun()
+                    else:
+                        # Clamp question index (safe guard against content changes).
+                        q_idx = min(
+                            st.session_state["player_quiz_q_idx"], len(questions) - 1
+                        )
+                        q = questions[q_idx]
+                        opts = q["options"]
+
+                        # Progress caption.
+                        n_quizzes = len(section_quiz_ids)
+                        _q_meta = f"Question {q_idx + 1} of {len(questions)}"
+                        if n_quizzes > 1:
+                            _q_meta = f"Quiz {quiz_idx + 1} of {n_quizzes}  ·  {_q_meta}"
+                        st.markdown(
+                            f'<p class="cb-progress-meta">{_q_meta}</p>',
+                            unsafe_allow_html=True,
+                        )
+
+                        if quiz.get("title"):
+                            st.subheader(quiz["title"])
+
+                        st.markdown(f"**{q['question']}**")
+                        st.markdown("<div style='height: 10px'></div>", unsafe_allow_html=True)
+
+                        radio_key = f"qsel_{active_section_id}_{quiz_id}_{q_idx}"
+                        chosen = st.radio(
+                            "Choose your answer:",
+                            options=list(range(len(opts))),
+                            format_func=lambda j, o=opts: o[j],
+                            key=radio_key,
+                            label_visibility="collapsed",
+                            index=None,
+                        )
+                        st.markdown("<div style='height: 8px'></div>", unsafe_allow_html=True)
+
+                        qk = f"{active_section_id}:{quiz_id}:{q_idx}"
+                        attempts = st.session_state["player_quiz_attempts"].get(qk, 0)
+                        already_correct = qk in st.session_state["player_quiz_correct"]
+
+                        if already_correct:
+                            st.success("Correct!")
+                        elif attempts >= 3:
+                            correct_text = opts[q["correct_index"]]
+                            st.info(f"Correct answer: **{correct_text}**")
+                        else:
+                            if st.button("Submit Answer", type="primary", use_container_width=True, key=f"submit_ans_{qk}", disabled=(chosen is None)):
+                                if chosen == q["correct_index"]:
+                                    st.session_state["player_quiz_correct"].add(qk)
+                                    # Cadence: fire on 1-based odd positions (q_idx 0, 2, 4...).
+                                    # Rotate message per quiz so multi-quiz sections vary.
+                                    if q_idx % 2 == 0:
+                                        _qbucket = _QUIZ_MSGS[active_idx % 3]
+                                        _qmsg, _qicon = _qbucket[quiz_idx % len(_qbucket)]
+                                        st.session_state["player_toast"] = (_qmsg, _qicon)
+                                    st.rerun()
+                                else:
+                                    new_attempts = attempts + 1
+                                    st.session_state["player_quiz_attempts"][qk] = new_attempts
+                                    if new_attempts < 3:
+                                        st.warning(q.get("hint", "Not quite — try again."))
+                                        tries_left = 3 - new_attempts
+                                        st.caption(f"Attempt {new_attempts} of 3 used. You have {tries_left} {'try' if tries_left == 1 else 'tries'} left.")
+                                    else:
+                                        st.rerun()  # rerun to reveal correct answer
+                            if chosen is None:
+                                st.caption("Select an answer to continue.")
+
+                        # Next → shown when correct or all attempts exhausted.
+                        if already_correct or attempts >= 3:
+                            if st.button("Next →", type="primary", use_container_width=True, key=f"next_{qk}"):
+                                if q_idx < len(questions) - 1:
+                                    st.session_state["player_quiz_q_idx"] = q_idx + 1
+                                else:
+                                    # Last question in this quiz — advance to next quiz.
+                                    st.session_state["player_quiz_idx"] = quiz_idx + 1
+                                    st.session_state["player_quiz_q_idx"] = 0
+                                st.rerun()
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    _render_tutor_expander()
+
+# ── REFLECTION ────────────────────────────────────────────────────────────────
+elif step == "reflection":
+    with st.container(border=True):
+        st.markdown('<div class="cb-card-inner">', unsafe_allow_html=True)
+        if not section_prompt_ids:
+            st.info("No reflection prompts for this section.")
+            if st.button("Continue to Complete →", type="primary", use_container_width=True):
+                st.session_state["player_flow_step"] = "complete"
+                st.rerun()
+        else:
+            refl_idx = st.session_state["player_refl_idx"]
+
+            if refl_idx >= len(section_prompt_ids):
+                # All prompts answered — show continue.
+                st.success("Reflections saved. You've completed this section!")
+                if st.button("Continue to Complete →", type="primary", use_container_width=True):
+                    st.session_state["player_flow_step"] = "complete"
+                    st.rerun()
+            else:
+                # Clamp (safe guard against content changes).
+                refl_idx = min(refl_idx, len(section_prompt_ids) - 1)
+                prompt_id = section_prompt_ids[refl_idx]
+                question = _PROMPT_QUESTIONS.get(
+                    prompt_id,
+                    prompt_id.replace("_", " ").capitalize(),
+                )
+
+                st.markdown(
+                    f'<p class="cb-progress-meta">Reflection {refl_idx + 1} of {len(section_prompt_ids)}</p>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"**{question}**")
+                st.markdown("<div style='height: 8px'></div>", unsafe_allow_html=True)
+
+                _RATING_OPTIONS = [
+                    "1 - Very low",
+                    "2 - Low",
+                    "3 - Neutral",
+                    "4 - Confident",
+                    "5 - Very confident",
+                ]
+                _is_rating_prompt = prompt_id in section_rating_prompts
+
+                if _is_rating_prompt:
+                    rating_key = f"reflection_rating_{active_section_id}_{refl_idx}"
+                    st.selectbox(
+                        label="Select your confidence level:",
+                        options=_RATING_OPTIONS,
+                        key=rating_key,
+                    )
+                    input_key = rating_key
+                else:
+                    txt_key = f"reflection_txt_{active_section_id}_{refl_idx}"
+                    if txt_key not in st.session_state:
+                        st.session_state[txt_key] = ""
+                    st.text_area(
+                        label="Your response",
+                        key=txt_key,
+                        height=140,
+                        placeholder="Write your response here…",
+                    )
+                    input_key = txt_key
+
+                st.markdown("<div style='height: 8px'></div>", unsafe_allow_html=True)
+
+                if st.button(
+                    "Save & Continue →",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"refl_save_{active_section_id}_{refl_idx}",
+                ):
+                    current_text = st.session_state.get(input_key, "").strip()
+                    _dbg_log(
+                        "refl_save_gate",
+                        input_key=input_key,
+                        current_text=current_text,
+                        active_section_id=active_section_id,
+                        refl_idx=refl_idx,
+                        player_refl_idx_before=st.session_state.get("player_refl_idx"),
+                    )
+                    if current_text:
+                        try:
+                            save_reflection_response(
+                                lead_id,
+                                COURSE_ID,
+                                active_section_id,
+                                refl_idx,
+                                current_text,
+                                created_at=datetime.now(timezone.utc).isoformat(),
+                                db_path=DB_PATH,
+                            )
+                            _dbg_log(
+                                "refl_save_ok",
+                                input_key=input_key,
+                                active_section_id=active_section_id,
+                                refl_idx=refl_idx,
+                                player_refl_idx_after=refl_idx + 1,
+                            )
+                            st.session_state["player_refl_idx"] = refl_idx + 1
+                            # Cadence: fire on 1-based odd positions (refl_idx 0, 2, 4...).
+                            # Advance rotation only on firing positions via integer division.
+                            if refl_idx % 2 == 0:
+                                _rbucket = _REFL_MSGS[active_idx % 3]
+                                _rmsg, _ricon = _rbucket[(refl_idx // 2) % len(_rbucket)]
+                                st.session_state["player_toast"] = (_rmsg, _ricon)
+                            st.rerun()
+                        except Exception:
+                            logging.exception("Error saving reflection response")
+                            st.error("Could not save. Please try again.")
+                    else:
+                        st.warning("Please write something before continuing.")
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    _render_tutor_expander()
+
+# ── COMPLETE ──────────────────────────────────────────────────────────────────
+elif step == "complete":
+    with st.container(border=True):
+        _has_next = active_idx < (len(SECTIONS) - 1)
+        _already_completed = active_section_id in st.session_state.get("player_completed", set())
+
+        if not (_already_completed and not _has_next):
+            st.markdown("### \u2713 Section complete")
+            st.markdown(
+                f"You've finished **{active_title}**. "
+                "Keep going — your progress is saved automatically."
+            )
+
+        # Compact progress summary — prefer already-fetched player_status.
+        _status = st.session_state.get("player_status")
+        if (
+            _already_completed
+            and _status
+            and _status.get("lead_exists")
+            and _status["course_state"]["completion_pct"] is not None
+        ):
+            _pct = _status["course_state"]["completion_pct"]
+            st.markdown(
+                f'<p class="cb-progress-meta">Course progress: {_pct:.0f}% complete</p>',
+                unsafe_allow_html=True,
+            )
+        else:
+            _done = len(st.session_state["player_completed"])
+            st.markdown(
+                f'<p class="cb-progress-meta">{_done} of {len(SECTIONS)} sections completed</p>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<div style='height: 4px'></div>", unsafe_allow_html=True)
+
+        # Auto-record completion on first entry to this step.
+        _write_error = False
+        if not _already_completed:
+            occurred_at = datetime.now(timezone.utc).isoformat()
+            event_id = f"{lead_id}:{active_section_id}"
+            try:
+                upsert_lead(lead_id, db_path=DB_PATH)
+                record_progress_event(
+                    event_id,
+                    lead_id,
+                    active_section_id,
+                    occurred_at=occurred_at,
+                    db_path=DB_PATH,
+                    webhook_url=COURSE_EVENT_WEBHOOK_URL,
+                )
+                _t0 = time.perf_counter()
+                finalize_on_completion(
+                    lead_id,
+                    total_sections=TOTAL_SECTIONS,
+                    now=occurred_at,
+                    db_path=DB_PATH,
+                    webhook_url=COURSE_EVENT_WEBHOOK_URL,
+                )
+                _dbg_log("timing", step="finalize_on_completion", elapsed_ms=round((time.perf_counter()-_t0)*1000))
+                try:
+                    if lead_id:
+                        _t0 = time.perf_counter()
+                        write_ghl_contact_fields(
+                            lead_id,
+                            now=occurred_at,
+                            ghl_api_url=GHL_API_URL,
+                            db_path=DB_PATH,
+                        )
+                        _dbg_log("timing", step="write_ghl_contact_fields", elapsed_ms=round((time.perf_counter()-_t0)*1000))
+                except Exception:
+                    logging.exception("GHL writeback failed at section completion")
+                updated_status = get_lead_status(lead_id, db_path=DB_PATH)
+                st.session_state["player_status"] = updated_status
+                _hydrate_completed_from_status(updated_status)
+                st.session_state["player_completed"].add(active_section_id)
+                # Suppress intercept on the immediate Mark Complete rerun (student stays on same section).
+                _trace_backnav("CLEAR_SITE_MARK_COMPLETE_BEFORE")
+                _dbg_log(
+                    "backnav_pending_set",
+                    reason="mark_complete", new_value=None, active_idx=active_idx,
+                    confirmed_idx=st.session_state.get("_section_radio_confirmed"),
+                    section_radio=st.session_state.get("_section_radio"),
+                    section_radio_pending=st.session_state.get("_section_radio_pending"),
+                    section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                    suppress_once=st.session_state.get("_suppress_backnav_once"),
+                    last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+                )
+                st.session_state["_backnav_pending_idx"] = None
+                _trace_backnav("CLEAR_SITE_MARK_COMPLETE_AFTER")
+                st.session_state["_suppress_backnav_once"] = True
+                # PLAYER_DEBUG: mark-complete log
+                _dbg_log(
+                    "marked_complete",
+                    active_idx=int(active_idx),
+                    active_section_id=active_section_id,
+                    state=_dbg_snap(st.session_state),
+                )
+                # CORY: dev-facing recommendation at shared section completion.
+                # Read-only — no DB writes. Errors are isolated and never
+                # surfaced to the student.
+                try:
+                    if lead_id:
+                        _cory_now = datetime.fromisoformat(occurred_at)
+                        _cory_rec = get_cora_recommendation(
+                            lead_id, now=_cory_now, db_path=DB_PATH
+                        )
+                        _dbg_log(
+                            "cory_recommendation",
+                            lead_id=lead_id,
+                            section=active_section_id,
+                            event_type=_cory_rec["event_type"],
+                            priority=_cory_rec["priority"],
+                            recommended_channel=_cory_rec["recommended_channel"],
+                        )
+                        send_course_event(
+                            "cory_recommendation",
+                            {
+                                "lead_id": lead_id,
+                                "section": active_section_id,
+                                "event_type": _cory_rec["event_type"],
+                                "priority": _cory_rec["priority"],
+                                "recommended_channel": _cory_rec["recommended_channel"],
+                                "reason_codes": _cory_rec["reason_codes"],
+                                "built_at": _cory_rec["built_at"],
+                            },
+                            webhook_url=COURSE_EVENT_WEBHOOK_URL,
+                        )
+                except Exception:
+                    logging.exception("Cory recommendation failed at section completion")
+                # Show unlock feedback when a new section becomes available.
+                try:
+                    _unlock_before = _allowed_max_idx(
+                        st.session_state["player_completed"] - {active_section_id}
+                    )
+                    _unlock_after = _allowed_max_idx(st.session_state["player_completed"])
+                    if _unlock_after > _unlock_before and _unlock_after < len(SECTIONS):
+                        _unlocked_title = SECTIONS[_unlock_after][1]
+                        try:
+                            st.toast(f"Unlocked: {_unlocked_title}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                st.rerun()
+            except ValueError:
+                logging.exception("ValueError marking %s complete", active_section_id)
+                st.error("Cannot record completion: unrecognised section.")
+                _write_error = True
+            except sqlite3.OperationalError:
+                st.error("Could not save progress. Check that tmp/app.db is accessible.")
+                _write_error = True
+            except Exception:
+                logging.exception("Unexpected error in Mark Complete")
+                st.error("An unexpected error occurred. See console for details.")
+                _write_error = True
+
+        st.markdown("<div style='height: 12px'></div>", unsafe_allow_html=True)
+        _has_next = active_idx < (len(SECTIONS) - 1)
+        _next_idx = active_idx + 1
+        _already_completed = active_section_id in st.session_state.get("player_completed", set())
+
+        _SECTION_RECAPS: dict[str, str] = {
+            "P1_S1": "You learned that AI is pattern recognition at scale — not magic — and saw how it quietly shapes navigation, recommendations, and fraud detection every day.",
+            "P1_S2": "You built a mental model of how machines improve from examples rather than rules, and understood training, patterns, and prediction at a practical level.",
+            "P1_S3": "You traced AI through real industries — from medical diagnostics to hiring algorithms — and started thinking about what AI literacy means for your own career.",
+            "P2_S1": "You learned what data actually is, why it comes in structured and unstructured forms, and why data quality sets the ceiling on everything an AI system can do.",
+            "P2_S2": "You followed raw data from collection to insight, practiced asking meaningful questions of numbers, and learned why skipping foundational data work makes AI fragile.",
+            "P2_S3": "You walked through the preparation steps — cleaning, reshaping, splitting — that determine whether a model learns from reality or learns from noise.",
+            "P3_S1": "You traced the full arc of building a machine learning model — from defining a goal to deployment — and saw where human judgment is required at every step.",
+            "P3_S2": "You learned why a single accuracy number isn't enough to trust a model, and practiced thinking about precision, recall, fairness, and real-world performance tradeoffs.",
+            "P3_S3": "You connected everything you've built into a clear picture of where to go next — from conceptual understanding to the applied skills that create real professional leverage.",
+        }
+        _recap_body = _SECTION_RECAPS.get(
+            active_section_id,
+            "You worked through the lesson, tested your understanding, and captured a reflection.",
+        )
+
+        if _already_completed and not _write_error:
+            st.markdown(
+                f"""<div class="cb-recap-card">
+  <p class="cb-recap-eyebrow">Section recap</p>
+  <p class="cb-recap-title">\u2713 {active_title}</p>
+  <p class="cb-recap-body">{_recap_body}</p>
+</div>""",
+                unsafe_allow_html=True,
+            )
+
+        if _write_error:
+            pass  # error already displayed above; student must reload to retry
+        elif _already_completed and not _has_next:
+            if not st.session_state.get("confetti_shown"):
+                st.session_state["confetti_shown"] = True
+                st.markdown(
+                    """
+<style>
+@keyframes cb-fall {
+  0%   { transform: translateY(-20px) rotate(0deg); opacity: 1; }
+  75%  { opacity: 1; }
+  100% { transform: translateY(100vh) rotate(540deg); opacity: 0; }
+}
+.cb-cp {
+  position: fixed; top: -12px;
+  animation: cb-fall linear 1 forwards;
+  pointer-events: none; z-index: 9999;
+}
+</style>
+<div class="cb-cp" style="left:3%;width:8px;height:8px;background:#EB3537;border-radius:2px;animation-delay:0s;animation-duration:2.5s"></div>
+<div class="cb-cp" style="left:9%;width:7px;height:7px;background:#2e7d52;border-radius:50%;animation-delay:0.3s;animation-duration:2.8s"></div>
+<div class="cb-cp" style="left:15%;width:9px;height:9px;background:#497095;border-radius:2px;animation-delay:0.1s;animation-duration:3.0s"></div>
+<div class="cb-cp" style="left:22%;width:6px;height:6px;background:#f59e0b;border-radius:50%;animation-delay:0.8s;animation-duration:2.4s"></div>
+<div class="cb-cp" style="left:29%;width:8px;height:8px;background:#EB3537;border-radius:2px;animation-delay:0.4s;animation-duration:3.2s"></div>
+<div class="cb-cp" style="left:36%;width:7px;height:7px;background:#8b5cf6;border-radius:50%;animation-delay:0.6s;animation-duration:2.6s"></div>
+<div class="cb-cp" style="left:43%;width:10px;height:10px;background:#2e7d52;border-radius:2px;animation-delay:0.2s;animation-duration:2.9s"></div>
+<div class="cb-cp" style="left:50%;width:6px;height:6px;background:#f59e0b;border-radius:2px;animation-delay:1.0s;animation-duration:2.3s"></div>
+<div class="cb-cp" style="left:57%;width:8px;height:8px;background:#497095;border-radius:50%;animation-delay:0.5s;animation-duration:3.1s"></div>
+<div class="cb-cp" style="left:63%;width:7px;height:7px;background:#EB3537;border-radius:50%;animation-delay:0.9s;animation-duration:2.7s"></div>
+<div class="cb-cp" style="left:70%;width:9px;height:9px;background:#8b5cf6;border-radius:2px;animation-delay:0.3s;animation-duration:2.5s"></div>
+<div class="cb-cp" style="left:77%;width:6px;height:6px;background:#2e7d52;border-radius:2px;animation-delay:0.7s;animation-duration:3.0s"></div>
+<div class="cb-cp" style="left:83%;width:8px;height:8px;background:#f59e0b;border-radius:50%;animation-delay:0.1s;animation-duration:2.8s"></div>
+<div class="cb-cp" style="left:90%;width:7px;height:7px;background:#497095;border-radius:2px;animation-delay:1.2s;animation-duration:2.4s"></div>
+<div class="cb-cp" style="left:96%;width:9px;height:9px;background:#EB3537;border-radius:50%;animation-delay:0.6s;animation-duration:3.3s"></div>
+<div class="cb-cp" style="left:7%;width:8px;height:8px;background:#8b5cf6;border-radius:2px;animation-delay:1.1s;animation-duration:2.6s"></div>
+<div class="cb-cp" style="left:18%;width:6px;height:6px;background:#2e7d52;border-radius:50%;animation-delay:0.4s;animation-duration:2.9s"></div>
+<div class="cb-cp" style="left:26%;width:9px;height:9px;background:#f59e0b;border-radius:2px;animation-delay:0.8s;animation-duration:3.1s"></div>
+<div class="cb-cp" style="left:33%;width:7px;height:7px;background:#EB3537;border-radius:50%;animation-delay:0.2s;animation-duration:2.7s"></div>
+<div class="cb-cp" style="left:40%;width:8px;height:8px;background:#497095;border-radius:2px;animation-delay:1.3s;animation-duration:2.5s"></div>
+<div class="cb-cp" style="left:48%;width:6px;height:6px;background:#8b5cf6;border-radius:50%;animation-delay:0.5s;animation-duration:3.2s"></div>
+<div class="cb-cp" style="left:55%;width:10px;height:10px;background:#2e7d52;border-radius:2px;animation-delay:0.9s;animation-duration:2.8s"></div>
+<div class="cb-cp" style="left:66%;width:7px;height:7px;background:#f59e0b;border-radius:50%;animation-delay:0.1s;animation-duration:2.4s"></div>
+<div class="cb-cp" style="left:74%;width:8px;height:8px;background:#EB3537;border-radius:2px;animation-delay:0.7s;animation-duration:3.0s"></div>
+<div class="cb-cp" style="left:80%;width:6px;height:6px;background:#497095;border-radius:50%;animation-delay:1.0s;animation-duration:2.6s"></div>
+<div class="cb-cp" style="left:87%;width:9px;height:9px;background:#8b5cf6;border-radius:2px;animation-delay:0.3s;animation-duration:2.9s"></div>
+<div class="cb-cp" style="left:93%;width:7px;height:7px;background:#2e7d52;border-radius:50%;animation-delay:0.8s;animation-duration:3.3s"></div>
+<div class="cb-cp" style="left:11%;width:8px;height:8px;background:#f59e0b;border-radius:2px;animation-delay:1.4s;animation-duration:2.3s"></div>
+<div class="cb-cp" style="left:45%;width:6px;height:6px;background:#EB3537;border-radius:50%;animation-delay:0.6s;animation-duration:3.1s"></div>
+<div class="cb-cp" style="left:60%;width:10px;height:10px;background:#497095;border-radius:2px;animation-delay:1.0s;animation-duration:2.4s"></div>
+<div class="cb-cp" style="left:72%;width:7px;height:7px;background:#8b5cf6;border-radius:50%;animation-delay:0.4s;animation-duration:2.8s"></div>
+<div class="cb-cp" style="left:85%;width:8px;height:8px;background:#2e7d52;border-radius:2px;animation-delay:0.9s;animation-duration:3.2s"></div>
+<div class="cb-cp" style="left:98%;width:6px;height:6px;background:#f59e0b;border-radius:50%;animation-delay:0.3s;animation-duration:2.6s"></div>
+<div class="cb-cp" style="left:52%;width:9px;height:9px;background:#EB3537;border-radius:2px;animation-delay:1.5s;animation-duration:2.3s"></div>
+<div class="cb-cp" style="left:38%;width:7px;height:7px;background:#497095;border-radius:50%;animation-delay:1.1s;animation-duration:2.7s"></div>
+""",
+                    unsafe_allow_html=True,
+                )
+            _covered_items = "\n".join(f"    <li>✓ {title}</li>" for _, title in SECTIONS)
+            st.markdown(
+                f"""<div class="cb-complete-hero">
+  <p class="cb-complete-eyebrow">Completed</p>
+  <h2 class="cb-complete-title">🎉 Course completed</h2>
+  <p class="cb-complete-body">
+    You finished all {len(SECTIONS)} lessons in Intro to AI and built a strong
+    foundation in the core ideas behind artificial intelligence.
+  </p>
+  <p class="cb-complete-covered">What you covered</p>
+  <ul class="cb-complete-items">
+{_covered_items}
+  </ul>
+</div>""",
+                unsafe_allow_html=True,
+            )
+            st.markdown("---")
+            st.markdown(
+                "Take a moment to reflect on what you've learned before reviewing the course."
+            )
+            st.markdown("<div style='height: 20px'></div>", unsafe_allow_html=True)
+            if st.button("← Review this Section"):
+                st.session_state["player_flow_step"] = "lesson"
+                st.session_state["player_flow_chunk_idx"] = 0
+                st.rerun()
+        else:
+            # ── Unlock banner — shown whenever this section is complete and a next section exists.
+            # Static HTML; renders identically on every rerun — no animation, no spam.
+            _next_title = SECTIONS[_next_idx][1]
+            st.markdown(
+                f"""<div class="cb-unlock-banner">
+  <span class="cb-unlock-icon">🔓</span>
+  <div>
+    <p class="cb-unlock-eyebrow">Next section unlocked</p>
+    <p class="cb-unlock-title">{_next_title}</p>
+  </div>
+</div>""",
+                unsafe_allow_html=True,
+            )
+            _dbg_log(
+                "next_section_gate",
+                run_id=_RUN_ID,
+                time=time.monotonic(),
+                _section_radio=st.session_state.get("_section_radio"),
+                _section_radio_confirmed=st.session_state.get("_section_radio_confirmed"),
+                _section_radio_pending=st.session_state.get("_section_radio_pending"),
+                _section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                _suppress_backnav_once=st.session_state.get("_suppress_backnav_once"),
+                _last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+                player_flow_step=st.session_state.get("player_flow_step"),
+                player_completed=sorted(list(st.session_state.get("player_completed", []))),
+                _backnav_pending_idx=st.session_state.get("_backnav_pending_idx"),
+                has_next=_has_next,
+                next_idx=int(_next_idx),
+            )
+            if _has_next:
+                with st.form(key=f"next_section_form_{st.session_state.get('_section_radio_confirmed', active_idx)}"):
+                    _clicked_next = st.form_submit_button("Go to next section \u2192", type="primary", use_container_width=True)
+            else:
+                _clicked_next = False
+            _dbg_log(
+                "next_section_clicked",
+                run_id=_RUN_ID,
+                time=time.monotonic(),
+                clicked=_clicked_next,
+                _section_radio=st.session_state.get("_section_radio"),
+                _section_radio_confirmed=st.session_state.get("_section_radio_confirmed"),
+                _section_radio_pending=st.session_state.get("_section_radio_pending"),
+                _section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                _suppress_backnav_once=st.session_state.get("_suppress_backnav_once"),
+                _last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+                player_flow_step=st.session_state.get("player_flow_step"),
+                player_completed=sorted(list(st.session_state.get("player_completed", []))),
+                _backnav_pending_idx=st.session_state.get("_backnav_pending_idx"),
+            )
+            if _has_next and _clicked_next:
+                st.session_state["_backnav_pending_idx"] = None
+                st.session_state["_section_radio_pending"] = int(_next_idx)
+                st.session_state["_section_radio_confirmed"] = int(_next_idx)
+                _dbg_log(
+                    "next_section_click",
+                    run_id=_RUN_ID,
+                    time=time.monotonic(),
+                    next_idx=int(_next_idx),
+                    _section_radio=st.session_state.get("_section_radio"),
+                    _section_radio_confirmed=st.session_state.get("_section_radio_confirmed"),
+                    _section_radio_pending=st.session_state.get("_section_radio_pending"),
+                    _section_radio_user_changed=st.session_state.get("_section_radio_user_changed"),
+                    _suppress_backnav_once=st.session_state.get("_suppress_backnav_once"),
+                    _last_sidebar_idx=st.session_state.get("_last_sidebar_idx"),
+                    player_flow_step=st.session_state.get("player_flow_step"),
+                    player_completed=sorted(list(st.session_state.get("player_completed", []))),
+                    _backnav_pending_idx=st.session_state.get("_backnav_pending_idx"),
+                )
+                st.session_state["_suppress_backnav_once"] = True
+                st.session_state["player_flow_step"] = "welcome"
+                st.session_state["player_flow_chunk_idx"] = 0
+                st.session_state["player_quiz_idx"] = 0
+                st.session_state["player_quiz_q_idx"] = 0
+                st.session_state["player_quiz_attempts"] = {}
+                st.session_state["player_quiz_correct"] = set()
+                st.session_state["player_refl_idx"] = 0
+                st.rerun()
+
+            st.markdown("<div style='height: 16px'></div>", unsafe_allow_html=True)
+            if st.button("← Restart this Section"):
+                st.session_state["player_flow_step"] = "lesson"
+                st.session_state["player_flow_chunk_idx"] = 0
+                st.rerun()

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.playwright-mcp/
+tmp/
+reports/
+Agent_Cory_Build_Guide_v1.md
+scripts/
+ui/assets/
+.git/

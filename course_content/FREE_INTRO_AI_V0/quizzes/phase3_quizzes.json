@@ -1,0 +1,58 @@
+[
+  {
+    "quiz_id": "quiz_phase3_mod3_1",
+    "title": "Exploring Data — Check",
+    "questions": [
+      {
+        "question": "What does EDA stand for in data science?",
+        "options": [
+          "Enhanced Data Architecture",
+          "Exploratory Data Analysis",
+          "External Data Aggregation",
+          "Estimated Distribution Average"
+        ],
+        "correct_index": 1,
+        "hint": "Think about what analysts do before building a model — they examine and explore the data to understand what's in it."
+      },
+      {
+        "question": "Which chart type is best suited for showing the distribution of a single numeric variable?",
+        "options": [
+          "Pie chart",
+          "Histogram",
+          "Line chart",
+          "Scatter plot"
+        ],
+        "correct_index": 1,
+        "hint": "Recall which visualization groups values into bins to show how often each range of values appears."
+      }
+    ]
+  },
+  {
+    "quiz_id": "quiz_phase3_mod3_2",
+    "title": "Preparing Data for AI — Check",
+    "questions": [
+      {
+        "question": "What is feature scaling used for in machine learning?",
+        "options": [
+          "Adding more rows to the dataset",
+          "Ensuring numeric features are on a comparable scale",
+          "Removing duplicate records",
+          "Converting text data to images"
+        ],
+        "correct_index": 1,
+        "hint": "Think about what happens when one feature is measured in thousands and another in single digits — scaling brings them onto the same playing field."
+      },
+      {
+        "question": "Which technique replaces missing values with the column mean?",
+        "options": [
+          "One-hot encoding",
+          "Mean imputation",
+          "Min-max normalization",
+          "Label encoding"
+        ],
+        "correct_index": 1,
+        "hint": "The name of this technique hints at the statistic being used to fill in the gaps."
+      }
+    ]
+  }
+]
