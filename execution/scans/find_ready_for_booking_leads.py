@@ -18,7 +18,7 @@ No writes, no dispatch, no side effects.
 from datetime import datetime, timedelta, timezone
 
 from execution.db.sqlite import connect, init_db
-from execution.leads.compute_hot_lead_signal import ACTIVITY_WINDOW_DAYS
+from execution.leads.compute_hot_lead_signal import ACTIVITY_WINDOW_HOURS
 
 _SQL = """
     SELECT l.id              AS lead_id,
@@ -77,7 +77,7 @@ def find_ready_for_booking_leads(
         )
 
     now_utc = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
-    activity_cutoff_iso = (now_utc - timedelta(days=ACTIVITY_WINDOW_DAYS)).isoformat()
+    activity_cutoff_iso = (now_utc - timedelta(hours=ACTIVITY_WINDOW_HOURS)).isoformat()
 
     conn = connect(db_path)
     try:

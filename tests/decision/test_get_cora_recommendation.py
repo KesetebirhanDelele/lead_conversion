@@ -93,8 +93,8 @@ class TestGetCoraRecommendation(unittest.TestCase):
     #      → HOT_LEAD_BOOKING
     # ------------------------------------------------------------------
     def test_hot_lead_booking_when_hot(self):
-        # Activity 3 days before _NOW → within the 7-day HOT window.
-        activity_ts = "2026-02-22T12:00:00+00:00"
+        # Activity 24h before _NOW → within the 48h HOT window.
+        activity_ts = "2026-02-24T12:00:00+00:00"
 
         upsert_lead("L1", db_path=TEST_DB_PATH)
         mark_course_invite_sent("I1", "L1", db_path=TEST_DB_PATH)

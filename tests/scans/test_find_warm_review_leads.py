@@ -18,7 +18,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from execution.db.sqlite import connect, init_db
 from execution.decision.build_cora_recommendation import STALL_DAYS
-from execution.leads.compute_hot_lead_signal import ACTIVITY_WINDOW_DAYS
+from execution.leads.compute_hot_lead_signal import ACTIVITY_WINDOW_HOURS
 from execution.scans.find_warm_review_leads import find_warm_review_leads
 
 TEST_DB_PATH = str(REPO_ROOT / "tmp" / "test_find_warm_review_leads.db")
@@ -31,8 +31,8 @@ def _iso(days_ago: int) -> str:
     return (_NOW - timedelta(days=days_ago)).isoformat()
 
 # Named timestamps for each zone
-_HOT_ZONE        = _iso(1)                         # 1 day ago  — inside 7-day HOT window → BOOKING_READY
-_WARM_ZONE       = _iso(ACTIVITY_WINDOW_DAYS + 1)  # 8 days ago — in WARM_REVIEW band
+_HOT_ZONE        = _iso(1)                                      # 1 day ago  — inside 48h HOT window → BOOKING_READY
+_WARM_ZONE       = _iso(ACTIVITY_WINDOW_HOURS // 24 + 1)        # 3 days ago — in WARM_REVIEW band
 _STALE_ZONE      = _iso(STALL_DAYS + 1)            # 15 days ago — past 14-day threshold → REENGAGE_COMPLETED
 _TS_CREATED      = "2026-01-01T00:00:00"
 _TS_STARTED      = "2026-02-01T00:00:00"
@@ -186,7 +186,7 @@ class TestFindWarmReviewLeads(unittest.TestCase):
         """Activity exactly at now - 7 days is still HOT → not included in WARM_REVIEW."""
         _seed_lead("L-hotedge")
         _seed_course_state("L-hotedge", completion_pct=100.0,
-                           last_activity_at=_iso(ACTIVITY_WINDOW_DAYS))
+                           last_activity_at=_iso(ACTIVITY_WINDOW_HOURS // 24))
         _seed_invite("L-hotedge")
 
         result = find_warm_review_leads(now=_NOW, db_path=TEST_DB_PATH)

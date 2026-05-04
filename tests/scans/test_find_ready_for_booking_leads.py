@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from execution.db.sqlite import connect, init_db
-from execution.leads.compute_hot_lead_signal import ACTIVITY_WINDOW_DAYS
+from execution.leads.compute_hot_lead_signal import ACTIVITY_WINDOW_HOURS
 from execution.scans.find_ready_for_booking_leads import find_ready_for_booking_leads
 
 TEST_DB_PATH = str(REPO_ROOT / "tmp" / "test_find_ready_for_booking_leads.db")
@@ -26,9 +26,9 @@ TEST_DB_PATH = str(REPO_ROOT / "tmp" / "test_find_ready_for_booking_leads.db")
 _NOW = datetime(2026, 2, 25, 12, 0, 0, tzinfo=timezone.utc)
 
 # Activity timestamps relative to _NOW
-_RECENT     = (_NOW - timedelta(days=1)).isoformat()   # 1 day ago — within window
-_AT_EDGE    = (_NOW - timedelta(days=ACTIVITY_WINDOW_DAYS)).isoformat()  # exactly at boundary
-_STALE      = (_NOW - timedelta(days=ACTIVITY_WINDOW_DAYS + 1)).isoformat()  # 1 day past window
+_RECENT     = (_NOW - timedelta(hours=1)).isoformat()                        # 1 hour ago — within window
+_AT_EDGE    = (_NOW - timedelta(hours=ACTIVITY_WINDOW_HOURS)).isoformat()    # exactly at boundary
+_STALE      = (_NOW - timedelta(hours=ACTIVITY_WINDOW_HOURS + 1)).isoformat()  # 1 hour past window
 
 _TS_CREATED = "2026-01-01T00:00:00"
 _TS_STARTED = "2026-02-01T00:00:00"

@@ -79,10 +79,10 @@ def mark_course_invite_sent(
 
         conn.execute(
             """
-            INSERT INTO course_invites (id, lead_id, course_id, sent_at, channel, token, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO course_invites (id, lead_id, course_id, generated_at, sent_at, channel, token, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (invite_id, lead_id, course_id, sent_at, channel, token, metadata_json),
+            (invite_id, lead_id, course_id, sent_at, sent_at, channel, token, metadata_json),
         )
         conn.commit()
     finally:

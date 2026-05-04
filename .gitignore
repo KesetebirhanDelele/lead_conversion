@@ -3,7 +3,7 @@
 Thumbs.db
 .vscode/
 .claude/
-
+.venv311/
 # Python
 __pycache__/
 *.pyc

@@ -69,27 +69,27 @@ class TestModeBReflectionScoring(unittest.TestCase):
         # HIGH earns full W_REFLECTION (15 pts); None earns 0 pts
         self.assertIn("REFLECTION_HIGH", result_with["reason_codes"])
 
-    def test_scenario_a_low_reflection_same_score_as_none(self):
-        """LOW reflection_confidence produces identical score to None (Mode B enforced)."""
+    def test_scenario_a_low_reflection_below_none(self):
+        """LOW reflection_confidence scores lower than None (LOW=3pts explicit; None=7pts neutral credit)."""
         result_with    = compute_lead_temperature(**_SHARED, reflection_confidence="LOW")
         result_without = compute_lead_temperature(**_SHARED, reflection_confidence=None)
 
-        self.assertEqual(
+        self.assertLess(
             result_with["score"],
             result_without["score"],
-            "Mode B violation: reflection_confidence='LOW' changed the score.",
+            "Expected LOW reflection (3pts) to score lower than unknown/None (7pts neutral credit).",
         )
 
-    def test_scenario_a_all_confidence_levels_produce_same_score(self):
+    def test_scenario_a_all_confidence_levels_produce_differentiated_scores(self):
         """HIGH / MEDIUM / LOW / None produce differentiated scores under Mode A scoring."""
         scores = {
             level: compute_lead_temperature(**_SHARED, reflection_confidence=level)["score"]
             for level in ("HIGH", "MEDIUM", "LOW", None)
         }
-        # Mode A: HIGH (15 pts) > MEDIUM (8 pts) > LOW/None (0 pts each)
+        # Mode A: HIGH (15 pts) > MEDIUM (9 pts) > LOW (3 pts) < None (7 pts neutral credit)
         self.assertGreater(scores["HIGH"],   scores["MEDIUM"], f"Expected HIGH > MEDIUM: {scores}")
         self.assertGreater(scores["MEDIUM"], scores["LOW"],    f"Expected MEDIUM > LOW: {scores}")
-        self.assertEqual(scores["LOW"],      scores[None],     f"Expected LOW == None: {scores}")
+        self.assertGreater(scores[None],     scores["LOW"],    f"Expected None (neutral) > LOW: {scores}")
 
     def test_scenario_a_reflection_reason_code_still_present(self):
         """Even though reflection does not affect the score, the reason code is still emitted."""

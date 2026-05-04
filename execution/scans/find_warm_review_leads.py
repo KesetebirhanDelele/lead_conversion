@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 from execution.db.sqlite import connect, init_db
 from execution.decision.build_cora_recommendation import STALL_DAYS
-from execution.leads.compute_hot_lead_signal import ACTIVITY_WINDOW_DAYS
+from execution.leads.compute_hot_lead_signal import ACTIVITY_WINDOW_HOURS
 
 _SQL = """
     SELECT l.id              AS lead_id,
@@ -81,7 +81,7 @@ def find_warm_review_leads(
         )
 
     now_utc = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
-    hot_cutoff_iso   = (now_utc - timedelta(days=ACTIVITY_WINDOW_DAYS)).isoformat()
+    hot_cutoff_iso   = (now_utc - timedelta(hours=ACTIVITY_WINDOW_HOURS)).isoformat()
     stale_cutoff_iso = (now_utc - timedelta(days=STALL_DAYS)).isoformat()
 
     conn = connect(db_path)

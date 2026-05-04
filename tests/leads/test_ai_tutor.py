@@ -137,6 +137,11 @@ class TestGenerateTutorReplyDeterministic:
     will only change if the source file is intentionally edited.
     """
 
+    def setup_method(self):
+        # Ensure OPENAI_API_KEY is absent for every test method, even when
+        # load_dotenv() was called by an earlier test module in the full suite.
+        os.environ.pop("OPENAI_API_KEY", None)
+
     def _reply(self, user_message: str, markdown: str = _RICH_MARKDOWN) -> str:
         return generate_tutor_reply(
             section_title=_SECTION_TITLE,

@@ -48,7 +48,7 @@ _ALL_SECTIONS: tuple[str, ...] = (
     "P3_S1", "P3_S2", "P3_S3",
 )
 
-# Must exceed ACTIVITY_WINDOW_DAYS (7) from directives/HOT_LEAD_SIGNAL.md.
+# Must exceed ACTIVITY_WINDOW_HOURS (48) from directives/HOT_LEAD_SIGNAL.md.
 _STALE_OFFSET_DAYS: int = 8
 
 
