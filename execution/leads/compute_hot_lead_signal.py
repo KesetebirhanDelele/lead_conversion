@@ -7,7 +7,7 @@ Rule specification: directives/HOT_LEAD_SIGNAL.md
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # Constants — locked for v1 (see directives/HOT_LEAD_SIGNAL.md §Locked thresholds)
 # ---------------------------------------------------------------------------
 COMPLETION_THRESHOLD_PCT: float = 25.0
-ACTIVITY_WINDOW_DAYS: int = 7
+ACTIVITY_WINDOW_HOURS: int = 48
 
 
 def _ensure_utc(dt: datetime, name: str) -> datetime:
@@ -111,7 +111,7 @@ def compute_hot_lead_signal(
         }
 
     last_utc = _ensure_utc(last_activity_time, "last_activity_time")
-    if (now_utc - last_utc).days > ACTIVITY_WINDOW_DAYS:
+    if (now_utc - last_utc) > timedelta(hours=ACTIVITY_WINDOW_HOURS):
         return {
             "hot": False,
             "reasons": ["ACTIVITY_STALE"],

@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from execution.leads.compute_hot_lead_signal import (  # noqa: E402
-    ACTIVITY_WINDOW_DAYS,
+    ACTIVITY_WINDOW_HOURS,
     COMPLETION_THRESHOLD_PCT,
     compute_hot_lead_signal,
 )
@@ -38,8 +38,8 @@ class TestComputeHotLeadSignal(unittest.TestCase):
     # T1 — All gates pass (30 %, 3 days ago, invited)
     # ------------------------------------------------------------------
     def test_t1_all_gates_pass(self):
-        """T1: invited, 30 % complete, active 3 days ago → hot=True, HOT_ENGAGED."""
-        last_activity = datetime(2026, 2, 21, 12, 0, 0, tzinfo=timezone.utc)
+        """T1: invited, 30 % complete, active 24 hours ago → hot=True, HOT_ENGAGED."""
+        last_activity = datetime(2026, 2, 23, 12, 0, 0, tzinfo=timezone.utc)
         result = compute_hot_lead_signal(
             invite_sent=True,
             completion_percent=30.0,
@@ -127,9 +127,9 @@ class TestComputeHotLeadSignal(unittest.TestCase):
     # T7 — Boundary: completion exactly 25.0 %, activity exactly 7 days ago
     # ------------------------------------------------------------------
     def test_t7_boundary_at_threshold(self):
-        """T7: completion=25.0 (==threshold) and delta=7 days (==window) → hot=True, HOT_ENGAGED."""
-        # now - 7 full days: timedelta(days=7).days == 7, which is <= ACTIVITY_WINDOW_DAYS
-        last_activity = datetime(2026, 2, 17, 12, 0, 0, tzinfo=timezone.utc)
+        """T7: completion=25.0 (==threshold) and delta=exactly 48 h (==window) → hot=True, HOT_ENGAGED."""
+        # exactly 48 h ago: timedelta(hours=48) is NOT > timedelta(hours=48)
+        last_activity = datetime(2026, 2, 22, 12, 0, 0, tzinfo=timezone.utc)
         result = compute_hot_lead_signal(
             invite_sent=True,
             completion_percent=25.0,
@@ -158,9 +158,9 @@ class TestComputeHotLeadSignal(unittest.TestCase):
     # T9 — Boundary: completion 25.0 %, activity exactly 8 days ago
     # ------------------------------------------------------------------
     def test_t9_boundary_just_outside_window(self):
-        """T9: completion=25.0 passes gate 2; delta=8 days > window → hot=False, ACTIVITY_STALE."""
-        # now - 8 full days: timedelta(days=8).days == 8, which is > ACTIVITY_WINDOW_DAYS
-        last_activity = datetime(2026, 2, 16, 12, 0, 0, tzinfo=timezone.utc)
+        """T9: completion=25.0 passes gate 2; delta=49 h > 48 h window → hot=False, ACTIVITY_STALE."""
+        # 49 hours ago: timedelta(hours=49) > timedelta(hours=48) → stale
+        last_activity = datetime(2026, 2, 22, 11, 0, 0, tzinfo=timezone.utc)
         result = compute_hot_lead_signal(
             invite_sent=True,
             completion_percent=25.0,
@@ -175,8 +175,8 @@ class TestComputeHotLeadSignal(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_t10_naive_last_activity_time_logs_warning(self):
         """T10: naive last_activity_time is treated as UTC; a WARNING is logged; result is deterministic."""
-        # Naive datetime equivalent to 2026-02-21T12:00:00Z → 3 days ago → within window
-        naive_last_activity = datetime(2026, 2, 21, 12, 0, 0)  # no tzinfo
+        # Naive datetime equivalent to 2026-02-23T12:00:00Z → 24 hours ago → within 48 h window
+        naive_last_activity = datetime(2026, 2, 23, 12, 0, 0)  # no tzinfo
         with self.assertLogs(_LOGGER, level="WARNING") as log_ctx:
             result = compute_hot_lead_signal(
                 invite_sent=True,
@@ -229,7 +229,7 @@ class TestComputeHotLeadSignal(unittest.TestCase):
     def test_constants_match_directive(self):
         """Module constants must match the values locked in directives/HOT_LEAD_SIGNAL.md."""
         self.assertEqual(COMPLETION_THRESHOLD_PCT, 25.0)
-        self.assertEqual(ACTIVITY_WINDOW_DAYS, 7)
+        self.assertEqual(ACTIVITY_WINDOW_HOURS, 48)
 
 
 if __name__ == "__main__":
