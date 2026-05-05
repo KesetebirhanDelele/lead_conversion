@@ -4,11 +4,12 @@ tests/test_backend_main.py
 API-layer tests for backend/main.py.
 
 These tests verify HTTP routing, request validation, response serialisation,
-and error handling.  All execution-layer functions are mocked — their own
-correctness is covered by their respective unit tests in tests/progress/
-and tests/leads/.
+auth, rate-limiting surface, and error handling.  All execution-layer
+functions are mocked — their own correctness is covered by their respective
+unit tests in tests/progress/ and tests/leads/.
 """
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -18,10 +19,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# Set API_KEYS before importing the app so the module sees the env var.
+_TEST_TOKEN = "test_token_backend_main"
+os.environ["API_KEYS"] = _TEST_TOKEN
+
 from fastapi.testclient import TestClient  # noqa: E402
 from backend.main import app               # noqa: E402
 
-client = TestClient(app)
+# Authenticated client — includes Bearer token on every request.
+client = TestClient(app, headers={"Authorization": f"Bearer {_TEST_TOKEN}"})
+
+# Unauthenticated client — used only in auth tests.
+anon_client = TestClient(app)
 
 # ---------------------------------------------------------------------------
 # Shared mock return values — match the full shape returned by get_lead_status
@@ -53,10 +62,79 @@ _STATUS_EXISTS = {
 
 
 # ---------------------------------------------------------------------------
+# GET /health (public)
+# ---------------------------------------------------------------------------
+
+def setUpModule():
+    os.environ["API_KEYS"] = _TEST_TOKEN
+
+
+def tearDownModule():
+    os.environ.pop("API_KEYS", None)
+
+
+class TestHealthEndpoint(unittest.TestCase):
+
+    def setUp(self):
+        os.environ["API_KEYS"] = _TEST_TOKEN
+
+    def test_health_returns_200(self):
+        resp = anon_client.get("/health")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_health_body_shape(self):
+        resp = anon_client.get("/health")
+        body = resp.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertIn("timestamp", body)
+
+
+# ---------------------------------------------------------------------------
+# Auth surface — POST /api/lead/status
+# ---------------------------------------------------------------------------
+
+class TestAuthSurface(unittest.TestCase):
+
+    def setUp(self):
+        os.environ["API_KEYS"] = _TEST_TOKEN
+
+    def test_missing_token_returns_401(self):
+        resp = anon_client.post("/api/lead/status", json={"lead_id": "x"})
+        self.assertEqual(resp.status_code, 401)
+
+    def test_wrong_token_returns_401(self):
+        resp = anon_client.post(
+            "/api/lead/status",
+            json={"lead_id": "x"},
+            headers={"Authorization": "Bearer bad_token"},
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    def test_valid_token_passes_auth(self):
+        with patch("backend.main.get_lead_status", return_value=_STATUS_NOT_FOUND):
+            resp = client.post("/api/lead/status", json={"lead_id": "x"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_error_detail_shape_on_invalid_token(self):
+        resp = anon_client.post(
+            "/api/lead/status",
+            json={"lead_id": "x"},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        body = resp.json()
+        self.assertIn("error", body["detail"])
+        self.assertIn("code", body["detail"]["error"])
+        self.assertIn("message", body["detail"]["error"])
+
+
+# ---------------------------------------------------------------------------
 # POST /api/lead/status
 # ---------------------------------------------------------------------------
 
 class TestLeadStatusEndpoint(unittest.TestCase):
+
+    def setUp(self):
+        os.environ["API_KEYS"] = _TEST_TOKEN
 
     def test_missing_lead_returns_lead_exists_false(self):
         """Unknown lead_id returns 200 with lead_exists=false."""
@@ -104,7 +182,10 @@ class TestLeadStatusEndpoint(unittest.TestCase):
         resp = client.post(
             "/api/lead/status",
             content="lead_id=user@example.com",
-            headers={"Content-Type": "text/plain"},
+            headers={
+                "Content-Type": "text/plain",
+                "Authorization": f"Bearer {_TEST_TOKEN}",
+            },
         )
         self.assertEqual(resp.status_code, 422)
 
@@ -114,6 +195,9 @@ class TestLeadStatusEndpoint(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestProgressUpdateEndpoint(unittest.TestCase):
+
+    def setUp(self):
+        os.environ["API_KEYS"] = _TEST_TOKEN
 
     def _mock_all(self, status_return=None):
         """Return a tuple of context managers that mock all execution calls."""
@@ -231,6 +315,9 @@ class TestProgressUpdateEndpoint(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestRouteSanity(unittest.TestCase):
+
+    def setUp(self):
+        os.environ["API_KEYS"] = _TEST_TOKEN
 
     def test_get_on_lead_status_returns_405(self):
         resp = client.get("/api/lead/status")
