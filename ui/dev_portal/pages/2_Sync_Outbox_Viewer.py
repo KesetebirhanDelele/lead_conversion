@@ -46,7 +46,7 @@ col_status, col_lead, col_limit = st.columns([1, 2, 1])
 with col_status:
     status_choice = st.selectbox(
         "Status filter",
-        options=["ALL", "NEEDS_SYNC", "SENT", "FAILED"],
+        options=["ALL", "SHADOW", "NEEDS_SYNC", "SENT", "FAILED"],
     )
 
 with col_lead:

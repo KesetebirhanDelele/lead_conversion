@@ -74,13 +74,13 @@
 
 | # | Item | File | Notes |
 |---|------|------|-------|
-| 4.1 | Shadow mode flag + behavior | `execution/ghl/write_ghl_contact_fields.py` | Read `GHL_SHADOW_MODE` env var; if true, write SHADOW to sync_records, skip HTTP POST |
-| 4.2 | Shadow mode env var | `.env` + `.env.example` | `GHL_SHADOW_MODE=true` |
-| 4.3 | Phone-based contact lookup | `execution/ghl/write_ghl_contact_fields.py` | Replace ID-based lookup with phone number query to LeadConnector |
-| 4.4 | Field mapping to LeadConnector schema | `execution/ghl/build_ghl_full_field_payload.py` | Map to: AI Campaign, AI Campaign Name, AI Campaign Value, Last AI Interaction, Lead Status |
-| 4.5 | Shadow log viewer | `ui/dev_portal/pages/2_Sync_Outbox_Viewer.py` | Show SHADOW rows alongside SENT/FAILED |
-| 4.6 | Bearer auth header | `execution/ghl/write_ghl_contact_fields.py` | ✅ Already wired (line 300) |
-| 4.7 | Live GHL sandbox test | Manual | Requires GHL_API_KEY + GHL_API_URL + test contact with phone |
+| 4.1 | Shadow mode flag + behavior | `execution/ghl/write_ghl_contact_fields.py` | ✅ `GHL_SHADOW_MODE` env var; writes SHADOW to sync_records, skips HTTP POST |
+| 4.2 | Shadow mode env var | `.env` + `.env.example` | ✅ `GHL_SHADOW_MODE=true` + `GHL_LOCATION_ID`, `GHL_CAMPAIGN_ID`, `GHL_CAMPAIGN_NAME`, field key overrides |
+| 4.3 | Phone-based contact lookup | `execution/ghl/lookup_ghl_contact_by_phone.py` | ✅ Phone-first LeadConnector search; falls back to stored ID + legacy lookup URL |
+| 4.4 | Field mapping to LeadConnector schema | `execution/ghl/build_m4_field_payload.py` | ✅ 5-field customFields payload; field keys configurable via env vars |
+| 4.5 | Shadow log viewer | `ui/dev_portal/pages/2_Sync_Outbox_Viewer.py` | ✅ SHADOW added to status filter dropdown |
+| 4.6 | Bearer auth header | `execution/ghl/write_ghl_contact_fields.py` | ✅ Already wired |
+| 4.7 | Live GHL sandbox test | Manual | Requires GHL_API_KEY + GHL_LOCATION_ID + GHL_API_URL + test contact with phone; set GHL_SHADOW_MODE=false |
 
 ---
 
@@ -128,7 +128,7 @@ M0 Foundation      ████████████ COMPLETE
 M1 Correctness     ████████░░░░ 3 gaps remaining
 M2 API Hardening   ░░░░░░░░░░░░ NOT STARTED
 M3 Scan→Dispatch   ████░░░░░░░░ Scans done, dispatch missing
-M4 GHL Push        ████████░░░░ Code done, shadow mode to build
+M4 GHL Push        ████████████ COMPLETE (shadow mode; live test pending)
 M5 Instrumentation ██░░░░░░░░░░ Stubs only
 M6 Production      ░░░░░░░░░░░░ NOT STARTED
 ```
