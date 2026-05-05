@@ -37,6 +37,7 @@ from execution.leads.upsert_lead import upsert_lead                             
 from execution.progress.compute_course_state import compute_course_state            # noqa: E402
 from execution.progress.finalize_on_completion import finalize_on_completion        # noqa: E402
 from execution.progress.record_progress_event import record_progress_event          # noqa: E402
+from execution.progress.record_quiz_score import record_quiz_score                  # noqa: E402
 from execution.decision.get_cora_recommendation import get_cora_recommendation       # noqa: E402
 from execution.events.send_course_event import send_course_event                    # noqa: E402
 from execution.reflection.load_reflection_responses import load_reflection_responses  # noqa: E402
@@ -1901,7 +1902,33 @@ elif step == "quiz":
                                 if q_idx < len(questions) - 1:
                                     st.session_state["player_quiz_q_idx"] = q_idx + 1
                                 else:
-                                    # Last question in this quiz — advance to next quiz.
+                                    # Last question — compute and persist the quiz score.
+                                    _correct = sum(
+                                        1
+                                        for _qi in range(len(questions))
+                                        if f"{active_section_id}:{quiz_id}:{_qi}"
+                                        in st.session_state["player_quiz_correct"]
+                                    )
+                                    _total_attempts = sum(
+                                        st.session_state["player_quiz_attempts"].get(
+                                            f"{active_section_id}:{quiz_id}:{_qi}", 1
+                                        )
+                                        for _qi in range(len(questions))
+                                    )
+                                    _score_pct = (_correct / len(questions) * 100.0) if questions else 0.0
+                                    try:
+                                        record_quiz_score(
+                                            lead_id,
+                                            section_id=active_section_id,
+                                            quiz_id=quiz_id,
+                                            score_pct=_score_pct,
+                                            attempts=max(_total_attempts, 1),
+                                            now=datetime.now(timezone.utc).isoformat(),
+                                            db_path=DB_PATH,
+                                        )
+                                    except Exception:
+                                        logging.exception("record_quiz_score failed — non-fatal")
+                                    # Advance to next quiz.
                                     st.session_state["player_quiz_idx"] = quiz_idx + 1
                                     st.session_state["player_quiz_q_idx"] = 0
                                 st.rerun()

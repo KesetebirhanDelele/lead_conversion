@@ -26,17 +26,29 @@ def get_db_path() -> str:
     return str(tmp_dir / "app.db")
 
 
-def connect(db_path: str | None = None) -> sqlite3.Connection:
-    """Open and return a sqlite3 connection with foreign key enforcement enabled.
+def connect(db_path: str | None = None):
+    """Open and return a database connection.
+
+    When db_path is None and DATABASE_URL is set to a postgres:// or
+    postgresql:// URI, delegates to execution.db.postgres.connect() and
+    returns a _PgConnection wrapper.  In all other cases returns a
+    sqlite3.Connection with PRAGMA foreign_keys = ON.
 
     Args:
-        db_path: Path to the SQLite file. Defaults to the result of get_db_path().
+        db_path: Path to the SQLite file. Defaults to get_db_path().
+                 When provided, always uses SQLite regardless of DATABASE_URL.
 
     Returns:
-        sqlite3.Connection: An open connection with PRAGMA foreign_keys = ON.
+        sqlite3.Connection or _PgConnection — both support the same
+        execute / commit / close interface used throughout the codebase.
     """
     if db_path is None:
+        database_url = os.environ.get("DATABASE_URL", "")
+        if database_url.startswith(("postgres://", "postgresql://")):
+            from execution.db.postgres import connect as _pg_connect
+            return _pg_connect(database_url)
         db_path = get_db_path()
+
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row  # rows accessible by column name
@@ -175,6 +187,22 @@ def init_db(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_lead_final_scores_label
             ON lead_final_scores (final_label);
+
+        CREATE TABLE IF NOT EXISTS quiz_scores (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id     TEXT NOT NULL,
+            course_id   TEXT NOT NULL DEFAULT 'FREE_INTRO_AI_V0',
+            section_id  TEXT NOT NULL,
+            quiz_id     TEXT NOT NULL,
+            score_pct   REAL NOT NULL,
+            attempts    INTEGER NOT NULL,
+            recorded_at TEXT NOT NULL,
+            FOREIGN KEY (lead_id) REFERENCES leads (id),
+            UNIQUE (lead_id, course_id, section_id, quiz_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_quiz_scores_lead_course
+            ON quiz_scores (lead_id, course_id);
     """)
     conn.commit()
 
@@ -280,6 +308,21 @@ def init_db(conn: sqlite3.Connection) -> None:
             DROP TABLE course_state;
             ALTER TABLE course_state_new RENAME TO course_state;
         """)
+
+    # ---------------------------------------------------------------------------
+    # Idempotent column migrations — add avg_quiz_score and avg_quiz_attempts
+    # to course_state for existing databases.
+    # ---------------------------------------------------------------------------
+    existing_cs_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(course_state)").fetchall()
+    }
+    if "avg_quiz_score" not in existing_cs_cols:
+        conn.execute("ALTER TABLE course_state ADD COLUMN avg_quiz_score REAL")
+        conn.commit()
+    if "avg_quiz_attempts" not in existing_cs_cols:
+        conn.execute("ALTER TABLE course_state ADD COLUMN avg_quiz_attempts REAL")
+        conn.commit()
 
     # ---------------------------------------------------------------------------
     # Idempotent column migration — add ghl_contact_id to leads for existing

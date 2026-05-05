@@ -90,7 +90,8 @@ def _read_lead_data(app_lead_id: str, db_path: str | None) -> dict | None:
 
         cs = conn.execute(
             """
-            SELECT current_section, completion_pct, last_activity_at, started_at
+            SELECT current_section, completion_pct, last_activity_at, started_at,
+                   avg_quiz_score, avg_quiz_attempts
             FROM course_state
             WHERE lead_id = ?
             """,
@@ -300,10 +301,12 @@ def build_ghl_full_field_payload(
     # ------------------------------------------------------------------
     # 3. Compute hot-lead signal (needed for lifecycle + scoring).
     # ------------------------------------------------------------------
-    last_activity_at  = cs["last_activity_at"] if cs else None
-    completion_pct    = cs["completion_pct"]    if cs else None
-    started_at        = cs["started_at"]        if cs else None
-    current_section   = cs["current_section"]   if cs else None
+    last_activity_at  = cs["last_activity_at"]   if cs else None
+    completion_pct    = cs["completion_pct"]     if cs else None
+    started_at        = cs["started_at"]         if cs else None
+    current_section   = cs["current_section"]    if cs else None
+    avg_quiz_score    = cs["avg_quiz_score"]     if cs else None
+    avg_quiz_attempts = cs["avg_quiz_attempts"]  if cs else None
 
     last_activity_dt: datetime | None = None
     if last_activity_at is not None:
@@ -364,8 +367,8 @@ def build_ghl_full_field_payload(
             completion_percent=completion_pct,
             last_activity_at=last_activity_at,
             started_at=started_at,
-            avg_quiz_score=None,
-            avg_quiz_attempts=None,
+            avg_quiz_score=avg_quiz_score,
+            avg_quiz_attempts=avg_quiz_attempts,
             reflection_confidence=reflection_confidence,
             current_section=current_section,
         )

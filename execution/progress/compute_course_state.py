@@ -84,6 +84,18 @@ def compute_course_state(
         ).fetchone()[0]
 
         completion_pct = (distinct_sections / total_sections) * 100.0
+
+        quiz_agg = conn.execute(
+            """
+            SELECT AVG(score_pct) AS avg_score, AVG(attempts) AS avg_attempts
+            FROM quiz_scores
+            WHERE lead_id = ? AND course_id = ?
+            """,
+            (lead_id, course_id),
+        ).fetchone()
+        avg_quiz_score    = quiz_agg["avg_score"]    if quiz_agg else None
+        avg_quiz_attempts = quiz_agg["avg_attempts"] if quiz_agg else None
+
         now = _utc_now()
 
         # Read the existing row for two transition guards used after the write:
@@ -101,26 +113,30 @@ def compute_course_state(
             conn.execute(
                 """
                 UPDATE course_state
-                SET current_section  = ?,
-                    completion_pct   = ?,
-                    last_activity_at = ?,
-                    started_at       = COALESCE(started_at, ?),
-                    updated_at       = ?
+                SET current_section   = ?,
+                    completion_pct    = ?,
+                    last_activity_at  = ?,
+                    started_at        = COALESCE(started_at, ?),
+                    avg_quiz_score    = ?,
+                    avg_quiz_attempts = ?,
+                    updated_at        = ?
                 WHERE lead_id = ? AND course_id = ?
                 """,
-                (current_section, completion_pct, last_activity_at, first_activity_at, now,
-                 lead_id, course_id),
+                (current_section, completion_pct, last_activity_at, first_activity_at,
+                 avg_quiz_score, avg_quiz_attempts, now, lead_id, course_id),
             )
         else:
             conn.execute(
                 """
                 INSERT INTO course_state
                     (lead_id, course_id, current_section, completion_pct,
-                     last_activity_at, started_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     last_activity_at, started_at, avg_quiz_score, avg_quiz_attempts,
+                     updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (lead_id, course_id, current_section, completion_pct,
-                 last_activity_at, first_activity_at, now),
+                 last_activity_at, first_activity_at, avg_quiz_score, avg_quiz_attempts,
+                 now),
             )
 
         conn.commit()

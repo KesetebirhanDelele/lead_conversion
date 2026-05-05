@@ -8,7 +8,9 @@ No business logic or state computation lives here — only data retrieval.
 from datetime import datetime, timezone
 
 from execution.db.sqlite import connect, init_db
+from execution.leads.classify_final_lead_label import classify_final_lead_label
 from execution.leads.compute_hot_lead_signal import compute_hot_lead_signal
+from execution.leads.compute_lead_temperature import compute_lead_temperature
 
 _EMPTY_STATUS = {
     "lead_exists": False,
@@ -64,7 +66,12 @@ def get_lead_status(
         ).fetchone()[0]
 
         cs = conn.execute(
-            "SELECT current_section, completion_pct, last_activity_at, started_at FROM course_state WHERE lead_id = ?",
+            """
+            SELECT current_section, completion_pct, last_activity_at, started_at,
+                   avg_quiz_score, avg_quiz_attempts
+            FROM course_state
+            WHERE lead_id = ?
+            """,
             (lead_id,),
         ).fetchone()
 
@@ -88,18 +95,42 @@ def get_lead_status(
     hot_score = None
     hot_reason = hot_result["reasons"][0]
 
+    avg_quiz_score    = cs["avg_quiz_score"]    if cs else None
+    avg_quiz_attempts = cs["avg_quiz_attempts"] if cs else None
+
+    temp_result = compute_lead_temperature(
+        now=now_utc,
+        invited_sent=invite_count > 0,
+        completion_percent=cs["completion_pct"] if cs else None,
+        last_activity_at=cs["last_activity_at"] if cs else None,
+        started_at=cs["started_at"] if cs else None,
+        avg_quiz_score=avg_quiz_score,
+        avg_quiz_attempts=avg_quiz_attempts,
+        reflection_confidence=None,
+        current_section=cs["current_section"] if cs else None,
+    )
+
     return {
         "lead_exists": True,
         "invite_sent": invite_count > 0,
         "course_state": {
-            "current_section": cs["current_section"] if cs else None,
-            "completion_pct": cs["completion_pct"] if cs else None,
+            "current_section":  cs["current_section"]  if cs else None,
+            "completion_pct":   cs["completion_pct"]   if cs else None,
             "last_activity_at": cs["last_activity_at"] if cs else None,
-            "started_at": cs["started_at"] if cs else None,
+            "started_at":       cs["started_at"]       if cs else None,
+            "avg_quiz_score":   avg_quiz_score,
+            "avg_quiz_attempts": avg_quiz_attempts,
         },
         "hot_lead": {
             "signal": hot_signal,
-            "score": hot_score,
+            "score":  hot_score,
             "reason": hot_reason,
+        },
+        "temperature": {
+            "score":          temp_result["score"],
+            "signal":         temp_result["signal"],
+            "reason_codes":   temp_result["reason_codes"],
+            "reason_summary": temp_result["reason_summary"],
+            "label":          classify_final_lead_label(temp_result["score"]),
         },
     }

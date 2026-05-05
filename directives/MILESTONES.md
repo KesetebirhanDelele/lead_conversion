@@ -85,7 +85,7 @@
 ---
 
 ## Milestone 5 — Advanced Scoring / Instrumentation
-**Status: STUB — intentionally deferred**  
+**Status: COMPLETE**  
 **Quiz granularity:** Per quiz + per section (not per question).  
 **Reflection confidence:** Student self-rated via UI dropdown (not AI-derived).  
 **DB:** Migrate from SQLite to PostgreSQL — implement locally first, then Hetzner.  
@@ -93,13 +93,13 @@
 
 | # | Item | File | Notes |
 |---|------|------|-------|
-| 5.1 | Quiz score persistence (per quiz + section) | `execution/progress/record_quiz_score.py` (new) | Save score + attempts per quiz per section per lead |
-| 5.2 | Avg quiz score wired into course state | `execution/progress/compute_course_state.py` | Compute avg_quiz_score, avg_quiz_attempts from quiz_scores table |
-| 5.3 | Reflection confidence UI (student self-rated) | `ui/student_portal/pages/1_Student_Course_Player.py` | Dropdown: HIGH / MEDIUM / LOW at reflection step |
-| 5.4 | Temperature score uses real quiz + reflection | `execution/leads/get_lead_status.py` | Wire actual signals into `compute_lead_temperature` |
-| 5.5 | PostgreSQL migration (local first) | `execution/db/postgres.py` (new) | Replace SQLite with psycopg2; keep same interface; env-switched |
-| 5.6 | Course content structure ready | `course_content/FREE_INTRO_AI_V0/` | Use existing scripts; placeholder markdown stays until user fills in |
-| 5.7 | Agent personas defined | `agents/` | Behavioral specs for any AI persona used in flows |
+| 5.1 | Quiz score persistence (per quiz + section) | `execution/progress/record_quiz_score.py` | ✅ quiz_scores table; upsert per quiz per section per lead |
+| 5.2 | Avg quiz score wired into course state | `execution/progress/compute_course_state.py` | ✅ avg_quiz_score + avg_quiz_attempts computed and stored on every recompute |
+| 5.3 | Reflection confidence UI (student self-rated) | `ui/student_portal/pages/1_Student_Course_Player.py` | ✅ 1-5 selectbox already in place; `_resolve_reflection_confidence` converts to H/M/L |
+| 5.4 | Temperature score uses real quiz + reflection | `execution/leads/get_lead_status.py` | ✅ `get_lead_status` returns `temperature` dict with real quiz + lifecycle signals |
+| 5.5 | PostgreSQL migration (local first) | `execution/db/postgres.py` | ✅ psycopg2 backend with ?→%s adapter; env-switched via DATABASE_URL in sqlite.connect() |
+| 5.6 | Course content structure ready | `course_content/FREE_INTRO_AI_V0/` | ✅ 9 sections, 5 quiz files, course_map.json — placeholder content in place |
+| 5.7 | Agent personas defined | `agents/CORA.md` | ✅ Behavioral spec: inputs, outputs, event types, safety rules |
 
 ---
 
@@ -129,7 +129,7 @@ M1 Correctness     ████████░░░░ 3 gaps remaining
 M2 API Hardening   ░░░░░░░░░░░░ NOT STARTED
 M3 Scan→Dispatch   ████░░░░░░░░ Scans done, dispatch missing
 M4 GHL Push        ████████████ COMPLETE (shadow mode; live test pending)
-M5 Instrumentation ██░░░░░░░░░░ Stubs only
+M5 Instrumentation ████████████ COMPLETE
 M6 Production      ░░░░░░░░░░░░ NOT STARTED
 ```
 
